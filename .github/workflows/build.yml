@@ -1,8 +1,9 @@
 name: Build ShredPack EXE
+
 on:
   push:
-    tags:
-      - 'v*'  # Triggers a build every time you release a new version tag (like v1.0)
+    branches:
+      - main  # Automatically builds every time you push code changes to the main branch
 
 jobs:
   build-windows:
@@ -28,7 +29,11 @@ jobs:
       run: |
         pyinstaller --noconsole --onefile --collect-all tkinterdnd2 --name="ShredPack" shredpack.py
 
-    - name: Create Automatic Release Artifact
+    - name: Create or Update Rolling Release
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: "latest"
+        name: "ShredPack Automatic Build"
+        body: "Automated compilation of the latest commit on the main branch."
+        prerelease: true
         files: dist/ShredPack.exe
