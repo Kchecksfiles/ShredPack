@@ -1,0 +1,48 @@
+name: Build ShredPack
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash pyinstaller
+
+      - name: Build ShredPack.exe
+        run: pyinstaller --noconsole --onefile --collect-all py7zr --collect-all pycdlib --collect-all tkinterdnd2 --name ShredPack shredpack.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss'
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShredPack-build
+          path: |
+            dist\ShredPack.exe
+            Output\ShredPack-Setup.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist\ShredPack.exe
+            Output\ShredPack-Setup.exe
