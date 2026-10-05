@@ -8,9 +8,10 @@ ShredPack - a WinRAR-style archive extractor with its own built-in engine.
   its job and exits; nothing stays running in the background.
 
 Python packages bundled into the .exe at build time:
-    pip install py7zr pycdlib tkinterdnd2 send2trash pyinstaller
-(py7zr adds .7z, pycdlib adds .iso, tkinterdnd2 adds drag-and-drop,
- send2trash sends deleted originals to the Recycle Bin. All are optional at run time.)
+    pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash pyinstaller
+(py7zr adds .7z, pycdlib adds .iso, pyzipper adds AES-encrypted ZIPs,
+ tkinterdnd2 adds drag-and-drop, send2trash sends deleted originals to the
+ Recycle Bin. All are optional at run time.)
 """
 
 import os
@@ -27,8 +28,12 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
+import unicodedata
+import urllib.request
 import zipfile
 import zlib
+import webbrowser
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -48,6 +53,11 @@ except Exception:  # noqa: BLE001
     pycdlib = None
 
 try:
+    import pyzipper
+except Exception:  # noqa: BLE001
+    pyzipper = None
+
+try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except Exception:  # noqa: BLE001
     DND_FILES, TkinterDnD = None, None
@@ -62,14 +72,29 @@ except ImportError:
 # Constants
 # --------------------------------------------------------------------------
 APP_NAME = "ShredPack"
+APP_VERSION = "1.0.0"
 MENU_KEY = "ShredPack"
+
+# Point this at a raw text file you publish containing just the latest version
+# string (e.g. "1.1.0"), such as a raw GitHub URL to a VERSION.txt in your repo.
+# Leave blank to disable the update check entirely.
+VERSION_URL = ""
+RELEASES_URL = "https://github.com/"  # shown to the user when an update exists
 
 EXTENSIONS = (
     ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz",
-    ".iso", ".cab", ".xar",
+    ".iso", ".cab", ".xar", ".z01", ".zip.001",
 )
 TAR_COMPRESSED = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
-FORMATS_LABEL = "ZIP  \u2022  7Z  \u2022  TAR  \u2022  GZ  \u2022  BZ2  \u2022  XZ  \u2022  ISO  \u2022  CAB  \u2022  XAR"
+FORMATS_LABEL = "ZIP  \u2022  7Z  \u2022  TAR  \u2022  GZ  \u2022  BZ2  \u2022  XZ  \u2022  ISO  \u2022  CAB  \u2022  XAR  \u2022  split ZIP"
+
+# A decompression-bomb / low-disk-space guard. If an archive looks like it will
+# expand past this ratio, or won't fit the destination drive, the user is asked
+# to confirm before anything is written.
+MAX_SAFE_RATIO = 300
+MIN_FREE_MARGIN = 1.05  # require 5% headroom beyond the estimated output size
+
+LOG_MAX_BYTES = 512 * 1024
 
 # (registry sub-key name, menu text, mode). Explorer sorts sub-items by key name.
 MENU_ITEMS = (
@@ -149,12 +174,26 @@ def lp(path):
     return "\\\\?\\" + p
 
 
+BIDI_OVERRIDE_CHARS = {
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # LRE RLE PDF LRO RLO
+    "\u2066", "\u2067", "\u2068", "\u2069",  # LRI RLI FSI PDI
+}
+
+
+def strip_bidi_overrides(name):
+    """Remove Unicode bidi-override characters used to disguise file extensions
+    (e.g. making 'evil<RLO>gpj.exe' display as 'eviloexe.jpg')."""
+    cleaned = "".join(c for c in name if c not in BIDI_OVERRIDE_CHARS)
+    return unicodedata.normalize("NFC", cleaned)
+
+
 def clean_parts(name):
     """Split an archive member name into safe path components."""
     parts = []
     for p in name.replace("\\", "/").split("/"):
         if p in ("", ".", ".."):
             continue
+        p = strip_bidi_overrides(p)
         p = INVALID_CHARS.sub("_", p).rstrip(" .")
         if not p:
             continue
@@ -220,6 +259,175 @@ def remove_original(path):
         return True
     except OSError:
         return False
+
+
+# --------------------------------------------------------------------------
+# Diagnostics: crash/error log
+# --------------------------------------------------------------------------
+def app_data_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, APP_NAME)
+
+
+def log_path():
+    return os.path.join(app_data_dir(), "log.txt")
+
+
+def log_write(message):
+    try:
+        os.makedirs(app_data_dir(), exist_ok=True)
+        path = log_path()
+        if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+            with open(path, "rb") as f:
+                f.seek(-LOG_MAX_BYTES // 2, os.SEEK_END)
+                tail = f.read()
+            with open(path, "wb") as f:
+                f.write(b"--- (earlier log trimmed) ---\n")
+                f.write(tail)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (stamp, message))
+    except OSError:
+        pass
+
+
+def log_exception(context):
+    log_write("%s\n%s" % (context, traceback.format_exc()))
+
+
+def install_crash_handler():
+    def handle(exc_type, exc_value, exc_tb):
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_write("UNHANDLED EXCEPTION\n" + text)
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                "ShredPack hit an unexpected error and needs to close.\n\n"
+                "Details were saved to:\n%s" % log_path(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    sys.excepthook = handle
+
+
+# --------------------------------------------------------------------------
+# Update check (optional - reads a plain-text version file you publish)
+# --------------------------------------------------------------------------
+def parse_version(text):
+    return tuple(int(p) for p in re.findall(r"\d+", text)[:3]) or (0,)
+
+
+def check_for_update(callback):
+    """Background-safe: fetches VERSION_URL and calls callback(latest_str or None)."""
+    if not VERSION_URL:
+        return
+    def worker():
+        try:
+            with urllib.request.urlopen(VERSION_URL, timeout=4) as resp:
+                latest = resp.read(200).decode("utf-8", "replace").strip()
+            if parse_version(latest) > parse_version(APP_VERSION):
+                callback(latest)
+            else:
+                callback(None)
+        except Exception:  # noqa: BLE001
+            callback(None)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# Mark of the Web (Zone.Identifier) propagation
+# --------------------------------------------------------------------------
+def read_zone_identifier(path):
+    """Return the raw bytes of a file's Zone.Identifier NTFS stream, or None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        with open(path + ":Zone.Identifier", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write_zone_identifier(path, data):
+    if sys.platform != "win32" or not data:
+        return
+    try:
+        with open(path + ":Zone.Identifier", "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
+def propagate_mark_of_the_web(archive_path, dest_root, new_files):
+    """Copy the archive's own download mark onto everything just extracted,
+    so Windows SmartScreen still warns before running an extracted .exe,
+    the same way Explorer's own 'Extract All' behaves."""
+    zone = read_zone_identifier(archive_path)
+    if not zone:
+        return
+    for rel in new_files:
+        write_zone_identifier(os.path.join(dest_root, rel), zone)
+
+
+# --------------------------------------------------------------------------
+# Decompression-bomb / low-disk-space guard
+# --------------------------------------------------------------------------
+def estimate_uncompressed_size(path, fmt):
+    """Best-effort uncompressed size for a pre-flight check. Returns None if unknown."""
+    try:
+        if fmt == "zip":
+            with zipfile.ZipFile(path) as zf:
+                return sum(i.file_size for i in zf.infolist())
+        if fmt == "7z" and py7zr is not None:
+            with py7zr.SevenZipFile(path, mode="r") as z:
+                return sum(f.uncompressed for f in z.list() if not f.is_directory)
+        if fmt == "cab":
+            return None  # header-only estimate isn't worth the parse cost twice
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def disk_free_bytes(path):
+    try:
+        probe = path
+        while probe and not os.path.exists(lp(probe)):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        return shutil.disk_usage(probe or ".").free
+    except OSError:
+        return None
+
+
+def preflight_risk(path, dest, fmt):
+    """Returns a warning string if extraction looks risky, else None."""
+    try:
+        compressed = os.path.getsize(path)
+    except OSError:
+        compressed = 0
+    uncompressed = estimate_uncompressed_size(path, fmt)
+    warnings = []
+
+    if uncompressed and compressed and compressed > 0:
+        ratio = uncompressed / float(compressed)
+        if ratio > MAX_SAFE_RATIO and uncompressed > 200 * 1024 * 1024:
+            warnings.append(
+                "This archive would expand to about %s from a %s file (%.0fx). "
+                "That's unusually large and could be a decompression bomb."
+                % (fmt_size(uncompressed), fmt_size(compressed), ratio)
+            )
+
+    if uncompressed:
+        free = disk_free_bytes(dest)
+        if free is not None and uncompressed * MIN_FREE_MARGIN > free:
+            warnings.append(
+                "This needs about %s of free space, but only %s is available there."
+                % (fmt_size(int(uncompressed * MIN_FREE_MARGIN)), fmt_size(free))
+            )
+
+    return "\n\n".join(warnings) if warnings else None
 
 
 def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
@@ -330,15 +538,42 @@ def is_dir_entry(info):
 
 
 # ---- ZIP ------------------------------------------------------------------
+def _is_aes_info(info):
+    """A ZIP entry using WinZip AES encryption carries extra field 0x9901."""
+    extra = info.extra
+    i = 0
+    while i + 4 <= len(extra):
+        hid, size = struct.unpack("<HH", extra[i:i + 4])
+        if hid == 0x9901:
+            return True
+        i += 4 + size
+    return False
+
+
 def extract_zip(path, stage, ctx):
     with zipfile.ZipFile(path) as zf:
         infos = [i for i in zf.infolist() if not is_junk(i.filename)]
         if not infos:
             raise ArchiveError("The archive is empty.")
         encrypted = any(i.flag_bits & 0x1 for i in infos)
+        uses_aes = any(_is_aes_info(i) for i in infos)
         pw = ctx.password.encode("utf-8") if ctx.password else None
         if encrypted and pw is None:
             raise NeedPassword(False)
+
+        if uses_aes:
+            if pyzipper is None:
+                raise Unsupported(
+                    "This ZIP is AES-encrypted. AES support isn't included in this build "
+                    "(the pyzipper package is missing)."
+                )
+            _extract_zip_with(pyzipper.AESZipFile(path), infos, stage, ctx, pw, encrypted)
+            return
+        _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=True)
+
+
+def _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=False):
+    try:
         ctx.total = max(1, sum(i.file_size for i in infos))
         for info in infos:
             parts = clean_parts(info.filename)
@@ -351,12 +586,12 @@ def extract_zip(path, stage, ctx):
                 with zf.open(info, pwd=pw if info.flag_bits & 0x1 else None) as src:
                     target = write_member(stage, parts, src, ctx)
             except RuntimeError as exc:
-                if "password" in str(exc).lower():
+                if "password" in str(exc).lower() or "Bad password" in str(exc):
                     raise NeedPassword(pw is not None)
                 raise
             except NotImplementedError:
                 raise ArchiveError(
-                    "This ZIP uses a compression method or AES encryption that ShredPack can't read."
+                    "This ZIP uses a compression method ShredPack can't read."
                 )
             except zipfile.BadZipFile:
                 if encrypted and pw is not None:
@@ -367,6 +602,70 @@ def extract_zip(path, stage, ctx):
                 os.utime(lp(target), (ts, ts))
             except (OverflowError, ValueError, OSError):
                 pass
+    finally:
+        if not already_open:
+            zf.close()
+
+
+# ---- multi-part / split archives -------------------------------------------
+def detect_split_parts(path):
+    """If `path` is one piece of a split archive, return the ordered list of
+    all part paths; otherwise None. Supports PKZIP-style name.z01..name.zip
+    and the generic name.zip.001/.002... convention produced by many archivers."""
+    folder = os.path.dirname(path)
+    base = os.path.basename(path)
+    low = base.lower()
+
+    def exists(name):
+        return os.path.isfile(os.path.join(folder, name))
+
+    # name.zip.001, name.zip.002, ... (case-preserving: strip the numeric suffix
+    # from the actual filename rather than the lowercased copy)
+    m = re.match(r"^(.+\.zip)\.(\d{2,4})$", low)
+    width = len(m.group(2)) if m else (3 if low.endswith(".zip") and exists(base + ".001") else 0)
+    if width:
+        stem_name = base[: -(width + 1)] if m else base
+        parts, n = [], 1
+        while exists("%s.%s" % (stem_name, str(n).zfill(width))):
+            parts.append(os.path.join(folder, "%s.%s" % (stem_name, str(n).zfill(width))))
+            n += 1
+        if len(parts) > 1:
+            return parts
+
+    # name.z01, name.z02, ..., name.zip (the .zip piece holds the central directory)
+    stem = None
+    if re.match(r"^.+\.z\d{2,3}$", low):
+        stem = base[: base.rfind(".")]
+    elif low.endswith(".zip"):
+        stem = base[:-4]
+    if stem is not None:
+        final = os.path.join(folder, stem + ".zip")
+        if os.path.isfile(final):
+            parts, n = [], 1
+            while True:
+                hit = None
+                for width in (2, 3):
+                    cand = os.path.join(folder, "%s.z%s" % (stem, str(n).zfill(width)))
+                    if os.path.isfile(cand):
+                        hit = cand
+                        break
+                if hit is None:
+                    break
+                parts.append(hit)
+                n += 1
+            if parts:
+                return parts + [final]
+    return None
+
+
+def join_split_parts(parts, workdir):
+    """Concatenate split-archive parts into one temp file and return its path."""
+    joined = os.path.join(workdir, "joined.zip")
+    with open(lp(joined), "wb") as out:
+        for part in parts:
+            with open(lp(part), "rb") as f:
+                shutil.copyfileobj(f, out, CHUNK)
+    return joined
 
 
 # ---- TAR (plain, .gz, .bz2, .xz) --------------------------------------------
@@ -769,38 +1068,76 @@ def detect_format(path):
     raise Unsupported("ShredPack doesn't recognise this file as a supported archive.")
 
 
-def merge_into(src, dst):
-    """Move everything from the staging folder into dst; never overwrite existing files."""
+def merge_into(src, dst, rel=""):
+    """Move everything from the staging folder into dst; never overwrite existing
+    files. Returns the list of final file paths (relative to the top-level dst)
+    that were newly placed, for Mark-of-the-Web propagation."""
+    placed = []
     for entry in os.scandir(lp(src)):
         target = os.path.join(dst, entry.name)
+        rel_name = os.path.join(rel, entry.name) if rel else entry.name
         if entry.is_dir(follow_symlinks=False):
             if os.path.isdir(lp(target)):
-                merge_into(os.path.join(src, entry.name), target)
+                placed.extend(merge_into(os.path.join(src, entry.name), target, rel_name))
             elif os.path.exists(lp(target)):
-                os.rename(lp(os.path.join(src, entry.name)), lp(unique_path(dst, entry.name)))
+                renamed = unique_path(dst, entry.name)
+                os.rename(lp(os.path.join(src, entry.name)), lp(renamed))
+                placed.extend(
+                    os.path.join(rel, os.path.basename(renamed), r) if rel
+                    else os.path.join(os.path.basename(renamed), r)
+                    for r in _list_all_files(renamed)
+                )
             else:
                 os.rename(lp(os.path.join(src, entry.name)), lp(target))
+                placed.extend(
+                    os.path.join(rel_name, r) for r in _list_all_files(target)
+                )
         else:
             if os.path.exists(lp(target)):
                 target = unique_file_path(dst, entry.name)
+                rel_name = os.path.join(rel, os.path.basename(target)) if rel else os.path.basename(target)
             os.rename(lp(os.path.join(src, entry.name)), lp(target))
+            placed.append(rel_name)
     try:
         os.rmdir(lp(src))
     except OSError:
         pass
+    return placed
 
 
-def extract_archive(path, dest, ctx):
-    """Extract `path` into `dest` (created if needed). Raises on any failure."""
-    handler = HANDLERS[detect_format(path)]
+def _list_all_files(folder):
+    out = []
+    for r, _d, fs in os.walk(lp(folder)):
+        for f in fs:
+            out.append(os.path.relpath(os.path.join(r, f), lp(folder)))
+    return out
+
+
+def compute_dest(arc, mode, dest_dir, subfolder):
+    base = os.path.dirname(arc)
+    stem = archive_stem(arc)
+    if mode == "here":
+        return base
+    if mode == "folder":
+        return unique_path(base, stem)
+    return unique_path(dest_dir, stem) if subfolder else dest_dir
+
+
+def extract_archive(path, dest, ctx, motw_source=None):
+    """Extract `path` into `dest` (created if needed). Raises on any failure.
+    If `motw_source` is given, its download "Mark of the Web" (if any) is
+    copied onto every file that lands in `dest` from this extraction."""
     existed = os.path.isdir(lp(dest))
     os.makedirs(lp(dest), exist_ok=True)
     stage = None
     try:
+        handler = HANDLERS[detect_format(path)]
         stage = tempfile.mkdtemp(prefix=".shredpack_", dir=dest)
         handler(path, stage, ctx)
         ctx.finish()
-        merge_into(stage, dest)
+        placed = merge_into(stage, dest)
+        if motw_source:
+            propagate_mark_of_the_web(motw_source, dest, placed)
     except BaseException:
         if stage:
             shutil.rmtree(lp(stage), ignore_errors=True)
@@ -968,6 +1305,12 @@ class ShredPackApp(object):
         root.lift()
         root.focus_force()
 
+        check_for_update(self._on_update_result)
+
+    def _on_update_result(self, latest):
+        if latest:
+            self.root.after(0, lambda: self.update_link.config(text="Update available: v" + latest))
+
     def px(self, v):
         return int(round(v * self.k))
 
@@ -1014,6 +1357,10 @@ class ShredPackApp(object):
         logo.create_text(px(15), px(15), text="S", font=(FONT, 12, "bold"), fill="#0b2530")
         tk.Label(header, text=APP_NAME, font=(FONT_SEMI, 15), fg=TEXT, bg=BG).pack(
             side="left", padx=(px(10), 0))
+        self.update_link = tk.Label(
+            header, text="", font=(FONT, 9, "underline"), fg=ACCENT, bg=BG, cursor="hand2")
+        self.update_link.pack(side="right")
+        self.update_link.bind("<Button-1>", lambda e: webbrowser.open(RELEASES_URL))
 
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill="both", expand=True, padx=px(28), pady=(0, px(24)))
@@ -1199,7 +1546,19 @@ class ShredPackApp(object):
 
     # ---- choice view --------------------------------------------------------
     def open_archives(self, files, mode):
-        self.archives = [os.path.abspath(f) for f in files]
+        abs_files = [os.path.abspath(f) for f in files]
+        # Collapse a multi-part set down to one representative entry so a user
+        # who selects (or drags) several pieces of the same split archive only
+        # gets one extraction, not one per part.
+        seen, resolved = set(), []
+        for f in abs_files:
+            group = detect_split_parts(f)
+            key = tuple(sorted(p.lower() for p in group)) if group else (f.lower(),)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(f)
+        self.archives = resolved
         self.mode = mode
         self.dest_var.set(os.path.dirname(self.archives[0]))
         self.sub_var.set(False)
@@ -1270,6 +1629,9 @@ class ShredPackApp(object):
             subfolder = self.sub_var.get()
         delete = self.delete_var.get()
 
+        if not self._preflight_ok(dest_dir, subfolder):
+            return
+
         self.state = "processing"
         self.cancel.clear()
         self.progress_var.set(0)
@@ -1282,6 +1644,29 @@ class ShredPackApp(object):
             daemon=True,
         ).start()
         self.root.after(40, self._poll)
+
+    def _preflight_ok(self, dest_dir, subfolder):
+        """Warn (and let the user bail out) before extracting anything that
+        looks like a decompression bomb or won't fit the destination drive.
+        Skipped for split/multi-part archives, which can't be sized cheaply."""
+        for arc in self.archives:
+            if detect_split_parts(arc):
+                continue
+            try:
+                fmt = detect_format(arc)
+            except ArchiveError:
+                continue
+            dest = compute_dest(arc, self.mode, dest_dir, subfolder)
+            risk = preflight_risk(arc, dest, fmt)
+            if risk:
+                proceed = messagebox.askyesno(
+                    APP_NAME,
+                    "%s\n\n%s\n\nContinue anyway?" % (shorten(os.path.basename(arc), 50), risk),
+                    parent=self.root, icon="warning",
+                )
+                if not proceed:
+                    return False
+        return True
 
     def on_cancel(self):
         if self.state == "processing":
@@ -1315,22 +1700,22 @@ class ShredPackApp(object):
             self.q.put(("file", idx, total, name))
             res = {"path": arc, "name": name, "status": "error", "detail": "",
                    "deleted": False, "delete_failed": False}
+            join_dir = None
             try:
-                base = os.path.dirname(arc)
-                stem = archive_stem(arc)
-                if mode == "here":
-                    dest = base
-                elif mode == "folder":
-                    dest = unique_path(base, stem)
-                else:
-                    dest = unique_path(dest_dir, stem) if subfolder else dest_dir
+                dest = compute_dest(arc, mode, dest_dir, subfolder)
+
+                parts = detect_split_parts(arc)
+                source = arc
+                if parts:
+                    join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
+                    source = join_split_parts(parts, join_dir)
 
                 password = None
                 while True:
                     ctx = Ctx(self.cancel,
                               lambda p, d, t: self.q.put(("progress", p, d, t)), password)
                     try:
-                        extract_archive(arc, dest, ctx)
+                        extract_archive(source, dest, ctx, motw_source=arc)
                         break
                     except NeedPassword as need:
                         password = self._ask_password(name, need.retry)
@@ -1340,12 +1725,19 @@ class ShredPackApp(object):
 
                 res["status"] = "ok"
                 if delete:
-                    ok = remove_original(arc)
-                    res["deleted"], res["delete_failed"] = ok, not ok
+                    originals = parts if parts else [arc]
+                    all_ok = True
+                    for p in originals:
+                        all_ok = remove_original(p) and all_ok
+                    res["deleted"], res["delete_failed"] = all_ok, not all_ok
             except Cancelled:
                 break
             except Exception as exc:  # noqa: BLE001
                 res["detail"] = describe_error(exc)
+                log_exception("Extraction failed for %s" % arc)
+            finally:
+                if join_dir:
+                    shutil.rmtree(join_dir, ignore_errors=True)
             results.append(res)
         self.q.put(("finished", results))
 
@@ -1442,6 +1834,8 @@ def make_root(with_dnd):
 
 
 def main():
+    install_crash_handler()
+    log_write("%s %s starting (args: %s)" % (APP_NAME, APP_VERSION, sys.argv[1:]))
     enable_dpi_awareness()
     args = sys.argv[1:]
     mode, files, i = "dialog", [], 0
