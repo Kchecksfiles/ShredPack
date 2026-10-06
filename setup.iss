@@ -25,6 +25,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+SetupIconFile=shredpack.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputBaseFilename=ShredPack-Setup
 Compression=lzma2
