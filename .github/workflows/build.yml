@@ -3,6 +3,9 @@ name: Build ShredPack
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -60,6 +63,7 @@ jobs:
         with:
           tag_name: latest
           name: ShredPack Latest
+          make_latest: true
           files: |
             dist\ShredPack.exe
             Output\ShredPack-Setup.exe
