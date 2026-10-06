@@ -27,13 +27,4 @@ jobs:
 
     - name: Compile Script to Standalone EXE
       run: |
-        pyinstaller --noconsole --onefile --collect-all tkinterdnd2 --name="ShredPack" shredpack.py
-
-    - name: Create or Update Rolling Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: "latest"
-        name: "ShredPack Automatic Build"
-        body: "Automated compilation of the latest commit on the main branch."
-        prerelease: true
-        files: dist/ShredPack.exe
+        pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
