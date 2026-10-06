@@ -74,6 +74,10 @@ except ImportError:
 APP_NAME = "ShredPack"
 APP_VERSION = "1.0.0"
 MENU_KEY = "ShredPack"
+COMPRESS_MENU_KEY = "ShredPackCompress"
+# Registry classes the "Add to..." submenu is installed under: any file, and
+# any folder. (Not Directory\Background - see the note in install_menu.)
+COMPRESS_CLASSES = ("*", "Directory")
 
 # Point this at a raw text file you publish containing just the latest version
 # string (e.g. "1.1.0"), such as a raw GitHub URL to a VERSION.txt in your repo.
@@ -97,10 +101,18 @@ MIN_FREE_MARGIN = 1.05  # require 5% headroom beyond the estimated output size
 LOG_MAX_BYTES = 512 * 1024
 
 # (registry sub-key name, menu text, mode). Explorer sorts sub-items by key name.
+# "Extract Here" always creates a new folder named after the archive right next
+# to it (see compute_dest) - there's no separate flat-extract option, to avoid
+# ever dumping an archive's loose files straight into an existing folder.
 MENU_ITEMS = (
     ("1extract", "Extract files...", "dialog"),
     ("2here", "Extract Here", "here"),
-    ("3folder", "Extract to folder named after the archive", "folder"),
+)
+
+# The "Add to..." submenu shown on ordinary files and folders (not archives).
+COMPRESS_MENU_ITEMS = (
+    ("1addzip", "Add to ZIP", "compress-quick"),
+    ("2addarchive", "Add to archive...", "compress-dialog"),
 )
 
 CHUNK = 1024 * 1024
@@ -1116,9 +1128,9 @@ def _list_all_files(folder):
 def compute_dest(arc, mode, dest_dir, subfolder):
     base = os.path.dirname(arc)
     stem = archive_stem(arc)
-    if mode == "here":
-        return base
-    if mode == "folder":
+    if mode in ("here", "folder"):
+        # "Extract Here" always lands in a new folder named after the archive,
+        # next to the archive itself - never dumps loose files into that folder.
         return unique_path(base, stem)
     return unique_path(dest_dir, stem) if subfolder else dest_dir
 
@@ -1167,8 +1179,201 @@ def describe_error(exc):
 
 
 # --------------------------------------------------------------------------
+# Compression engine (pure Python - creates archives, not just reads them)
+# --------------------------------------------------------------------------
+COMPRESS_FORMATS = (
+    # (key, display label, file extension, tar mode or None, supports password)
+    ("zip", "ZIP", ".zip", None, True),
+    ("7z", "7Z", ".7z", None, True),
+    ("tar", "TAR (uncompressed)", ".tar", "w", False),
+    ("targz", "TAR.GZ", ".tar.gz", "w:gz", False),
+    ("tarbz2", "TAR.BZ2", ".tar.bz2", "w:bz2", False),
+    ("tarxz", "TAR.XZ", ".tar.xz", "w:xz", False),
+)
+
+
+def compress_format_available(key):
+    if key == "7z":
+        return py7zr is not None
+    return True
+
+
+def compress_members(sources):
+    """Yield (arcname, abs_path, is_dir) for the given top-level sources,
+    recursing into folders. A folder source becomes the archive's own root
+    folder (name/...); a lone file keeps just its name; several sources are
+    each added at the top level under their own name."""
+    for src in sources:
+        name = sanitize_name(os.path.basename(os.path.normpath(src))) or "item"
+        if os.path.isdir(src):
+            yield (name, src, True)
+            for root, dirs, files in os.walk(src):
+                rel_root = os.path.relpath(root, src)
+                arc_root = name if rel_root == "." else "/".join(
+                    [name] + clean_parts(rel_root))
+                for d in dirs:
+                    yield (arc_root + "/" + sanitize_name(d), os.path.join(root, d), True)
+                for f in files:
+                    yield (arc_root + "/" + sanitize_name(f), os.path.join(root, f), False)
+        else:
+            yield (name, src, False)
+
+
+def default_archive_name(sources, ext):
+    if len(sources) == 1:
+        base = os.path.basename(os.path.normpath(sources[0]))
+        stem = os.path.splitext(base)[0] if os.path.isfile(sources[0]) else base
+    else:
+        parent = os.path.dirname(os.path.normpath(sources[0]))
+        stem = os.path.basename(parent) or "Archive"
+    return (sanitize_name(stem) or "Archive") + ext
+
+
+def compress_zip(sources, dest, ctx, password=None):
+    members = list(compress_members(sources))
+    ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
+
+    if password:
+        if pyzipper is None:
+            raise Unsupported(
+                "Password-protected ZIPs need the pyzipper package, which isn't included in this build."
+            )
+        zf = pyzipper.AESZipFile(
+            dest, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES
+        )
+        zf.setpassword(password.encode("utf-8"))
+    else:
+        zf = zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED)
+
+    try:
+        added_dirs = set()
+        for arcname, path, is_dir in members:
+            ctx._check()
+            if is_dir:
+                if arcname not in added_dirs:
+                    zf.writestr(zipfile.ZipInfo(arcname + "/"), b"")
+                    added_dirs.add(arcname)
+                continue
+            try:
+                dt = time.localtime(os.path.getmtime(path))[:6]
+            except OSError:
+                dt = time.localtime()[:6]
+            info = zipfile.ZipInfo(arcname, date_time=dt)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(lp(path), "rb") as src, zf.open(info, "w") as dst:
+                while True:
+                    chunk = src.read(CHUNK)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    ctx.add(len(chunk))
+    finally:
+        zf.close()
+    ctx.finish()
+
+
+class _ProgressReader(object):
+    """Wraps a file object so tarfile.addfile()'s internal reads count as progress."""
+
+    def __init__(self, fh, ctx):
+        self.fh, self.ctx = fh, ctx
+
+    def read(self, n=-1):
+        data = self.fh.read(n)
+        self.ctx.add(len(data))
+        return data
+
+
+def compress_tar(sources, dest, mode, ctx):
+    members = list(compress_members(sources))
+    ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
+    with tarfile.open(dest, mode) as tf:
+        added_dirs = set()
+        for arcname, path, is_dir in members:
+            ctx._check()
+            if is_dir:
+                if arcname not in added_dirs:
+                    info = tarfile.TarInfo(arcname)
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    info.mtime = time.time()
+                    tf.addfile(info)
+                    added_dirs.add(arcname)
+                continue
+            info = tf.gettarinfo(lp(path), arcname=arcname)
+            with open(lp(path), "rb") as f:
+                tf.addfile(info, _ProgressReader(f, ctx))
+    ctx.finish()
+
+
+def compress_7z(sources, dest, ctx, password=None):
+    if py7zr is None:
+        raise Unsupported(
+            "7Z creation needs the py7zr package, which isn't included in this build."
+        )
+    total = 0
+    for s in sources:
+        if os.path.isdir(s):
+            for root, _d, files in os.walk(s):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        else:
+            try:
+                total += os.path.getsize(s)
+            except OSError:
+                pass
+    ctx.total = max(1, total)
+    # py7zr doesn't expose fine-grained write progress, so this jumps once done
+    # rather than streaming - the progress bar will sit until the write finishes.
+    with py7zr.SevenZipFile(dest, "w", password=password) as z:
+        for s in sources:
+            name = sanitize_name(os.path.basename(os.path.normpath(s))) or "item"
+            ctx._check()
+            if os.path.isdir(s):
+                z.writeall(s, arcname=name)
+            else:
+                z.write(s, arcname=name)
+    ctx.finish()
+
+
+def compress_archive(sources, dest, fmt_key, ctx, password=None):
+    """Create `dest` from `sources` (files/folders). Writes to a temp sibling
+    file first so a failed or cancelled run never leaves a broken archive
+    where the real one should be."""
+    fmt = next(f for f in COMPRESS_FORMATS if f[0] == fmt_key)
+    tmp = dest + ".part"
+    try:
+        if fmt_key == "zip":
+            compress_zip(sources, tmp, ctx, password)
+        elif fmt_key == "7z":
+            compress_7z(sources, tmp, ctx, password)
+        else:
+            compress_tar(sources, tmp, fmt[3], ctx)
+        os.replace(lp(tmp), lp(dest))
+    except BaseException:
+        try:
+            os.remove(lp(tmp))
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------------------
 # Windows right-click integration (per-user registry, no admin rights needed)
 # --------------------------------------------------------------------------
+def app_icon_path():
+    """Path to the bundled shredpack.ico, whether running frozen or as a script."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "shredpack.ico")
+    return path if os.path.isfile(path) else None
+
+
 def launcher_command():
     if getattr(sys, "frozen", False):
         return '"%s"' % sys.executable
@@ -1185,6 +1390,10 @@ def menu_command(mode):
 
 def ext_key(ext):
     return r"Software\Classes\SystemFileAssociations\%s\shell\%s" % (ext, MENU_KEY)
+
+
+def compress_class_key(cls):
+    return r"Software\Classes\%s\shell\%s" % (cls, COMPRESS_MENU_KEY)
 
 
 def _delete_tree(path):
@@ -1216,28 +1425,36 @@ def uninstall_menu():
         return
     for ext in EXTENSIONS:
         _delete_tree(ext_key(ext))
+    for cls in COMPRESS_CLASSES:
+        _delete_tree(compress_class_key(cls))
     _notify_shell()
 
 
+def _install_cascade(base, items, icon):
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_WRITE) as k:
+        winreg.SetValueEx(k, "MUIVerb", 0, winreg.REG_SZ, APP_NAME)
+        winreg.SetValueEx(k, "SubCommands", 0, winreg.REG_SZ, "")
+        if icon:
+            winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
+    for name, label, mode in items:
+        sub = base + "\\shell\\" + name
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_WRITE) as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, label)
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub + r"\command", 0, winreg.KEY_WRITE) as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, menu_command(mode))
+
+
 def install_menu():
-    """Create a cascading 'ShredPack' submenu for every supported archive type."""
+    """Create cascading 'ShredPack' submenus: extraction on each archive type,
+    and 'Add to...' compression on any ordinary file or folder."""
     if sys.platform != "win32":
         return
-    uninstall_menu()  # also removes the old single-entry layout
+    uninstall_menu()  # also removes any old layout
     icon = '"%s",0' % sys.executable if getattr(sys, "frozen", False) else None
     for ext in EXTENSIONS:
-        base = ext_key(ext)
-        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_WRITE) as k:
-            winreg.SetValueEx(k, "MUIVerb", 0, winreg.REG_SZ, APP_NAME)
-            winreg.SetValueEx(k, "SubCommands", 0, winreg.REG_SZ, "")
-            if icon:
-                winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
-        for name, label, mode in MENU_ITEMS:
-            sub = base + "\\shell\\" + name
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_WRITE) as k:
-                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, label)
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub + r"\command", 0, winreg.KEY_WRITE) as k:
-                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, menu_command(mode))
+        _install_cascade(ext_key(ext), MENU_ITEMS, icon)
+    for cls in COMPRESS_CLASSES:
+        _install_cascade(compress_class_key(cls), COMPRESS_MENU_ITEMS, icon)
     _notify_shell()
 
 
@@ -1246,14 +1463,26 @@ def install_state():
     if sys.platform != "win32":
         return "none"
     key = ext_key(EXTENSIONS[0]) + "\\shell\\" + MENU_ITEMS[-1][0] + r"\command"
+    compress_key = compress_class_key("*") + "\\shell\\" + COMPRESS_MENU_ITEMS[-1][0] + r"\command"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
             value = winreg.QueryValueEx(k, "")[0]
-        return "current" if str(value).lower() == menu_command(MENU_ITEMS[-1][2]).lower() else "stale"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, compress_key) as k2:
+            value2 = winreg.QueryValueEx(k2, "")[0]
+        current = (
+            str(value).lower() == menu_command(MENU_ITEMS[-1][2]).lower()
+            and str(value2).lower() == menu_command(COMPRESS_MENU_ITEMS[-1][2]).lower()
+        )
+        return "current" if current else "stale"
     except OSError:
         pass
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ext_key(EXTENSIONS[0])):
+            return "stale"
+    except OSError:
+        pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, compress_class_key("*")):
             return "stale"
     except OSError:
         return "none"
@@ -1270,16 +1499,27 @@ class ShredPackApp(object):
         self.mode = mode
         self.k = max(1.0, root.winfo_fpixels("1i") / 96.0)
 
-        self.state = "home"  # home | choice | processing | finished
+        self.state = "home"  # home | choice | compress_choice | processing | finished
+        self.action = "extract"  # "extract" or "compress" - which flow "processing" belongs to
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.pw_event = threading.Event()
         self.pw_value = None
         self.cur_idx, self.cur_n = 1, 1
 
+        self.compress_sources = []
+        self._name_dirty = False
+        self._suppress_name_trace = False
+
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
+        icon_path = app_icon_path()
+        if icon_path and sys.platform == "win32":
+            try:
+                root.iconbitmap(default=icon_path)
+            except tk.TclError:
+                pass
         w, h = self.px(580), self.px(520)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
@@ -1288,7 +1528,7 @@ class ShredPackApp(object):
         self._build_ui()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.bind("<Return>", lambda e: self.begin() if self.state == "choice" else None)
+        root.bind("<Return>", lambda e: self._on_return())
         root.bind("<Escape>", lambda e: self.on_escape())
 
         if DND_FILES is not None and hasattr(root, "drop_target_register"):
@@ -1367,6 +1607,7 @@ class ShredPackApp(object):
 
         self._build_home(body)
         self._build_choice(body)
+        self._build_compress(body)
         self._build_progress(body)
         self._build_done(body)
 
@@ -1384,11 +1625,15 @@ class ShredPackApp(object):
         icon.create_line(c - px(14), c + px(18), c + px(14), c + px(18),
                          fill=ACCENT, width=lw, capstyle="round")
 
-        self._label(inner, "Open an archive to extract it", 16, True, TEXT).pack(pady=(px(12), 0))
-        hint = "Choose a file, or drag and drop it onto this window" if DND_FILES else "Choose an archive file"
+        self._label(inner, "Extract or create an archive", 16, True, TEXT).pack(pady=(px(12), 0))
+        hint = "Choose a file, or drag and drop it onto this window" if DND_FILES else "Choose an archive, or build a new one"
         self._label(inner, hint, 10).pack(pady=(px(4), 0))
-        ttk.Button(inner, text="Choose Archive...", style="Primary.TButton",
-                   command=self.choose_archives).pack(pady=(px(16), 0))
+        btn_row = tk.Frame(inner, bg=CARD)
+        btn_row.pack(pady=(px(16), 0))
+        ttk.Button(btn_row, text="Choose Archive...", style="Primary.TButton",
+                   command=self.choose_archives).pack(side="left")
+        ttk.Button(btn_row, text="Create Archive...", style="Secondary.TButton",
+                   command=self.choose_compress_entry).pack(side="left", padx=(px(10), 0))
         self._label(inner, FORMATS_LABEL, 8, color="#7c7c7c").pack(pady=(px(12), 0))
 
         tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(16), px(12)))
@@ -1445,6 +1690,76 @@ class ShredPackApp(object):
                         variable=self.delete_var, style="Zen.TCheckbutton"
                         ).pack(anchor="w", pady=(px(14), 0))
 
+    def _build_compress(self, body):
+        px = self.px
+        self.view_compress, inner = self._card(body)
+        bottom = tk.Frame(inner, bg=CARD)
+        bottom.pack(side="bottom", fill="x")
+        ttk.Button(bottom, text="Cancel", style="Secondary.TButton",
+                   command=self.cancel_compress).pack(side="right")
+        ttk.Button(bottom, text="Compress", style="Primary.TButton",
+                   command=self.begin_compress).pack(side="right", padx=(0, px(10)))
+
+        self.lbl_cx_name = self._label(inner, "", 14, True, TEXT, anchor="w", justify="left",
+                                       wraplength=px(480))
+        self.lbl_cx_name.pack(fill="x")
+        self.lbl_cx_meta = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(480))
+        self.lbl_cx_meta.pack(fill="x", pady=(px(2), 0))
+        add_row = tk.Frame(inner, bg=CARD)
+        add_row.pack(fill="x", pady=(px(8), 0))
+        ttk.Button(add_row, text="Add Files...", style="Secondary.TButton",
+                   command=self.add_compress_files).pack(side="left")
+        ttk.Button(add_row, text="Add Folder...", style="Secondary.TButton",
+                   command=self.add_compress_folder).pack(side="left", padx=(px(8), 0))
+
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=px(14))
+
+        fmt_row = tk.Frame(inner, bg=CARD)
+        fmt_row.pack(fill="x")
+        self._label(fmt_row, "Format", 10, anchor="w").pack(side="left")
+        self.compress_fmt_var = tk.StringVar(value="ZIP")
+        self.fmt_combo = ttk.Combobox(
+            fmt_row, textvariable=self.compress_fmt_var, state="readonly",
+            values=[f[1] for f in COMPRESS_FORMATS if compress_format_available(f[0])], width=16)
+        self.fmt_combo.pack(side="right")
+        self.fmt_combo.bind("<<ComboboxSelected>>", lambda e: self._on_format_change())
+
+        self._label(inner, "Archive name", 10, anchor="w").pack(fill="x", pady=(px(12), 0))
+        name_row = tk.Frame(inner, bg=CARD)
+        name_row.pack(fill="x", pady=(px(4), 0))
+        self.compress_name_var = tk.StringVar()
+        self.compress_name_var.trace_add("write", lambda *a: self._on_name_edit())
+        self.name_entry = tk.Entry(
+            name_row, textvariable=self.compress_name_var, font=(FONT, 10), bg=FIELD, fg=TEXT,
+            insertbackground=TEXT, relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.name_entry.pack(side="left", fill="x", expand=True, ipady=px(7))
+
+        self._label(inner, "Destination folder", 10, anchor="w").pack(fill="x", pady=(px(12), 0))
+        dest_row = tk.Frame(inner, bg=CARD)
+        dest_row.pack(fill="x", pady=(px(4), 0))
+        self.compress_dest_var = tk.StringVar()
+        self.cdest_entry = tk.Entry(
+            dest_row, textvariable=self.compress_dest_var, font=(FONT, 10), bg=FIELD, fg=TEXT,
+            insertbackground=TEXT, relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.cdest_entry.pack(side="left", fill="x", expand=True, ipady=px(7))
+        ttk.Button(dest_row, text="Browse...", style="Secondary.TButton",
+                   command=self.pick_compress_folder).pack(side="left", padx=(px(10), 0))
+
+        self.encrypt_var = tk.BooleanVar(value=False)
+        self.encrypt_chk = ttk.Checkbutton(
+            inner, text="Encrypt with a password (ZIP/7Z only)", variable=self.encrypt_var,
+            style="Zen.TCheckbutton", command=self._toggle_password_field)
+        self.encrypt_chk.pack(anchor="w", pady=(px(14), 0))
+
+        self.compress_password_var = tk.StringVar()
+        self.pw_entry = tk.Entry(
+            inner, textvariable=self.compress_password_var, show="*", font=(FONT, 10),
+            bg=FIELD, fg=TEXT, insertbackground=TEXT, relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT, state="disabled")
+        self.pw_entry.pack(fill="x", pady=(px(6), 0), ipady=px(7))
+
     def _build_progress(self, body):
         px = self.px
         self.view_progress, inner = self._card(body)
@@ -1468,7 +1783,8 @@ class ShredPackApp(object):
         box = tk.Frame(self.view_done, bg=CARD)
         box.place(relx=0.5, rely=0.5, anchor="center")
         tk.Label(box, text="\u2713", font=(FONT_SEMI, 46), fg=GREEN, bg=CARD).pack()
-        self._label(box, "Extraction complete", 16, True, TEXT).pack(pady=(px(4), 0))
+        self.lbl_d_title = self._label(box, "Extraction complete", 16, True, TEXT)
+        self.lbl_d_title.pack(pady=(px(4), 0))
         self.lbl_d_sub = self._label(box, "", 10, justify="center", wraplength=px(440))
         self.lbl_d_sub.pack(pady=(px(6), 0))
 
@@ -1482,13 +1798,15 @@ class ShredPackApp(object):
             self._register_dnd(child)
 
     def show(self, view):
-        for v in (self.view_home, self.view_choice, self.view_progress, self.view_done):
+        for v in (self.view_home, self.view_choice, self.view_compress,
+                  self.view_progress, self.view_done):
             v.pack_forget()
         view.pack(fill="both", expand=True)
 
     # ---- home ---------------------------------------------------------------
     def go_home(self):
         self.state = "home"
+        self.action = "extract"
         self.archives = []
         if sys.platform == "win32":
             self.refresh_menu_status()
@@ -1517,8 +1835,9 @@ class ShredPackApp(object):
                 install_menu()
                 messagebox.showinfo(
                     APP_NAME,
-                    'Done! Right-click any archive and choose "%s".\n\n'
-                    'On Windows 11 it appears under "Show more options".' % APP_NAME,
+                    'Done! Right-click an archive and choose "%s" to extract it, '
+                    'or right-click any file or folder and choose "%s" to compress it.\n\n'
+                    'On Windows 11 both appear under "Show more options".' % (APP_NAME, APP_NAME),
                     parent=self.root)
         except OSError as exc:
             messagebox.showerror(APP_NAME, "Couldn't update the registry:\n\n%s" % exc,
@@ -1533,19 +1852,39 @@ class ShredPackApp(object):
         if files:
             self.open_archives(list(files), "dialog")
 
+    def choose_compress_entry(self):
+        self.open_compress([], "dialog")
+
+    def _looks_like_archive(self, path):
+        try:
+            detect_format(path)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _on_drop(self, event):
-        if self.state == "home":
-            try:
-                paths = list(self.root.tk.splitlist(event.data))
-            except tk.TclError:
-                paths = []
-            files = [p for p in paths if os.path.isfile(p)]
-            if files:
-                self.open_archives(files, "dialog")
+        if self.state != "home":
+            return getattr(event, "action", "copy")
+        try:
+            paths = [p for p in self.root.tk.splitlist(event.data) if os.path.exists(p)]
+        except tk.TclError:
+            paths = []
+        if not paths:
+            return getattr(event, "action", "copy")
+        files_only = [p for p in paths if os.path.isfile(p)]
+        all_archives = (
+            files_only and len(files_only) == len(paths)
+            and all(self._looks_like_archive(p) for p in files_only)
+        )
+        if all_archives:
+            self.open_archives(files_only, "dialog")
+        else:
+            self.open_compress(paths, "dialog")
         return getattr(event, "action", "copy")
 
     # ---- choice view --------------------------------------------------------
     def open_archives(self, files, mode):
+        self.action = "extract"
         abs_files = [os.path.abspath(f) for f in files]
         # Collapse a multi-part set down to one representative entry so a user
         # who selects (or drags) several pieces of the same split archive only
@@ -1590,13 +1929,11 @@ class ShredPackApp(object):
             self.dest_row.pack(fill="x")
             self.sub_chk.pack(anchor="w", pady=(px(8), 0))
         else:
-            self.lbl_section.config(text="Extract Here" if self.mode == "here"
-                                    else "Extract to folder named after the archive")
-            if self.mode == "here":
-                hint = shorten(folder, 56) + ("  (each archive's own folder)" if len(self.archives) > 1 else "")
-            else:
-                stem = archive_stem(first) if len(self.archives) == 1 else "<archive name>"
-                hint = shorten(os.path.join(folder, stem), 56) + "\\"
+            self.lbl_section.config(text="Extract Here")
+            stem = archive_stem(first) if len(self.archives) == 1 else "<archive name>"
+            hint = shorten(os.path.join(folder, stem), 56) + "\\"
+            if len(self.archives) > 1:
+                hint += "  (each archive gets its own folder)"
             self.lbl_hint.config(text="\u2192  " + hint)
             self.lbl_hint.pack(fill="x")
 
@@ -1614,6 +1951,211 @@ class ShredPackApp(object):
             self.root.destroy()
         else:
             self.go_home()
+
+    # ---- compress view --------------------------------------------------------
+    def open_compress(self, sources, trigger_mode="dialog"):
+        self.action = "compress"
+        sources = [os.path.abspath(s) for s in sources if os.path.exists(s)]
+        if trigger_mode == "compress-quick" and len(sources) == 1:
+            self._run_quick_compress(sources[0])
+            return
+        self.compress_sources = sources
+        self._name_dirty = False
+        self.compress_dest_var.set("")
+        self.compress_password_var.set("")
+        self.encrypt_var.set(False)
+        self.pw_entry.config(state="disabled")
+        self.compress_fmt_var.set("ZIP")
+        self.state = "compress_choice"
+        self.refresh_compress()
+        self.show(self.view_compress)
+
+    def _run_quick_compress(self, source):
+        """The right-click 'Add to ZIP' quick action: no dialog, matches a
+        single click the way WinRAR's own 'Add to <name>.zip' entry does -
+        safe to skip confirmation because it only ever creates a new file
+        (never overwrites or deletes anything)."""
+        dest_dir = os.path.dirname(source)
+        dest_path = unique_file_path(dest_dir, default_archive_name([source], ".zip"))
+        self.compress_sources = [source]
+        self._start_compress_job([source], dest_path, "zip", None)
+
+    def refresh_compress(self):
+        n = len(self.compress_sources)
+        if n == 0:
+            self.lbl_cx_name.config(text="No items added yet")
+            self.lbl_cx_meta.config(text="Add files or a folder to build your archive")
+        elif n == 1:
+            s = self.compress_sources[0]
+            kind = "Folder" if os.path.isdir(s) else "File"
+            self.lbl_cx_name.config(text=shorten(os.path.basename(os.path.normpath(s)), 52))
+            self.lbl_cx_meta.config(text=kind)
+        else:
+            names = ", ".join(shorten(os.path.basename(os.path.normpath(s)), 20)
+                              for s in self.compress_sources[:3])
+            self.lbl_cx_name.config(text="%d items selected" % n)
+            self.lbl_cx_meta.config(text=names + ("\u2026" if n > 3 else ""))
+
+        fmt = next((f for f in COMPRESS_FORMATS if f[1] == self.compress_fmt_var.get()),
+                   COMPRESS_FORMATS[0])
+        if not self._name_dirty and self.compress_sources:
+            self._set_compress_name(default_archive_name(self.compress_sources, fmt[2]))
+        if self.compress_sources and not self.compress_dest_var.get().strip():
+            self.compress_dest_var.set(os.path.dirname(os.path.normpath(self.compress_sources[0])))
+
+    def _set_compress_name(self, name):
+        self._suppress_name_trace = True
+        self.compress_name_var.set(name)
+        self._suppress_name_trace = False
+
+    def _on_name_edit(self):
+        if not self._suppress_name_trace:
+            self._name_dirty = True
+
+    def _on_format_change(self):
+        fmt = next((f for f in COMPRESS_FORMATS if f[1] == self.compress_fmt_var.get()),
+                   COMPRESS_FORMATS[0])
+        if not compress_format_available(fmt[0]):
+            messagebox.showwarning(
+                APP_NAME, "%s support isn't included in this build." % fmt[1], parent=self.root)
+        if not fmt[4]:
+            self.encrypt_var.set(False)
+            self.encrypt_chk.state(["disabled"])
+            self.pw_entry.config(state="disabled")
+        else:
+            self.encrypt_chk.state(["!disabled"])
+        self.refresh_compress()
+
+    def _toggle_password_field(self):
+        self.pw_entry.config(state="normal" if self.encrypt_var.get() else "disabled")
+
+    def add_compress_files(self):
+        files = filedialog.askopenfilenames(parent=self.root, title="Add files to the archive")
+        if files:
+            self.compress_sources.extend(os.path.abspath(f) for f in files)
+            self.refresh_compress()
+
+    def add_compress_folder(self):
+        folder = filedialog.askdirectory(
+            parent=self.root, title="Add a folder to the archive", mustexist=True)
+        if folder:
+            self.compress_sources.append(os.path.abspath(folder))
+            self.refresh_compress()
+
+    def pick_compress_folder(self):
+        start = self.compress_dest_var.get().strip() or (
+            os.path.dirname(self.compress_sources[0]) if self.compress_sources
+            else os.path.expanduser("~"))
+        chosen = filedialog.askdirectory(parent=self.root, title="Choose destination folder",
+                                         initialdir=start, mustexist=False)
+        if chosen:
+            self.compress_dest_var.set(os.path.normpath(chosen))
+
+    def cancel_compress(self):
+        if self.from_shell:
+            self.root.destroy()
+        else:
+            self.go_home()
+
+    def begin_compress(self):
+        if self.state != "compress_choice":
+            return
+        if not self.compress_sources:
+            messagebox.showwarning(APP_NAME, "Add at least one file or folder first.", parent=self.root)
+            return
+
+        dest_dir = os.path.expandvars(self.compress_dest_var.get().strip().strip('"'))
+        if not dest_dir:
+            messagebox.showwarning(APP_NAME, "Please choose a destination folder.", parent=self.root)
+            return
+        dest_dir = os.path.abspath(dest_dir)
+
+        fmt = next((f for f in COMPRESS_FORMATS if f[1] == self.compress_fmt_var.get()),
+                   COMPRESS_FORMATS[0])
+        if not compress_format_available(fmt[0]):
+            messagebox.showerror(APP_NAME, "%s support isn't included in this build." % fmt[1],
+                                 parent=self.root)
+            return
+
+        name = self.compress_name_var.get().strip()
+        if not name:
+            name = default_archive_name(self.compress_sources, fmt[2])
+        for _k, _l, ext, _m, _p in COMPRESS_FORMATS:
+            if name.lower().endswith(ext.lower()):
+                name = name[: -len(ext)]
+                break
+        name = (sanitize_name(name) or "Archive") + fmt[2]
+
+        password = None
+        if self.encrypt_var.get():
+            if not fmt[4]:
+                messagebox.showwarning(
+                    APP_NAME, "%s archives don't support passwords. Choose ZIP or 7Z." % fmt[1],
+                    parent=self.root)
+                return
+            password = self.compress_password_var.get()
+            if not password:
+                messagebox.showwarning(APP_NAME, "Enter a password, or turn off encryption.",
+                                       parent=self.root)
+                return
+
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, "Couldn't use that destination:\n\n%s" % exc,
+                                 parent=self.root)
+            return
+
+        dest_path = unique_file_path(dest_dir, name)
+        self._start_compress_job(list(self.compress_sources), dest_path, fmt[0], password)
+
+    def _start_compress_job(self, sources, dest_path, fmt_key, password):
+        self.action = "compress"
+        self.state = "processing"
+        self.cancel.clear()
+        self.progress_var.set(0)
+        self.lbl_p_title.config(text="Preparing\u2026")
+        self.lbl_p_sub.config(text="")
+        self.cur_idx, self.cur_n = 1, 1
+        self.show(self.view_progress)
+        threading.Thread(
+            target=self._compress_worker, args=(sources, dest_path, fmt_key, password), daemon=True,
+        ).start()
+        self.root.after(40, self._poll)
+
+    def _compress_worker(self, sources, dest_path, fmt_key, password):
+        self.q.put(("file", 1, 1, os.path.basename(dest_path)))
+        result = {"status": "ok", "detail": "", "dest": dest_path}
+        try:
+            ctx = Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t)))
+            compress_archive(sources, dest_path, fmt_key, ctx, password)
+        except Cancelled:
+            result["status"] = "cancelled"
+        except Exception as exc:  # noqa: BLE001
+            result["status"] = "error"
+            result["detail"] = describe_error(exc)
+            log_exception("Compression failed for %s" % dest_path)
+        self.q.put(("compress_finished", result))
+
+    def _finish_compress(self, result):
+        if result["status"] == "cancelled":
+            self.state = "compress_choice"
+            self.show(self.view_compress)
+            return
+        if result["status"] == "error":
+            messagebox.showerror("%s - Compression failed" % APP_NAME, result["detail"],
+                                 parent=self.root)
+            self.state = "compress_choice"
+            self.show(self.view_compress)
+            return
+        self.state = "finished"
+        self.lbl_d_title.config(text="Compression complete")
+        self.lbl_d_sub.config(text=os.path.basename(result["dest"]))
+        self.show(self.view_done)
+        if self.from_shell:
+            self.root.after(1300, self.root.destroy)
+        else:
+            self.root.after(1300, self.go_home)
 
     # ---- running ------------------------------------------------------------
     def begin(self):
@@ -1673,9 +2215,17 @@ class ShredPackApp(object):
             self.cancel.set()
             self.lbl_p_sub.config(text="Cancelling\u2026")
 
+    def _on_return(self):
+        if self.state == "choice":
+            self.begin()
+        elif self.state == "compress_choice":
+            self.begin_compress()
+
     def on_escape(self):
         if self.state == "choice":
             self.cancel_choice()
+        elif self.state == "compress_choice":
+            self.cancel_compress()
         elif self.state == "processing":
             self.on_cancel()
 
@@ -1754,7 +2304,8 @@ class ShredPackApp(object):
         kind = msg[0]
         if kind == "file":
             _, self.cur_idx, self.cur_n, name = msg
-            self.lbl_p_title.config(text="Extracting " + shorten(name, 44))
+            verb = "Compressing " if self.action == "compress" else "Extracting "
+            self.lbl_p_title.config(text=verb + shorten(name, 44))
             self._set_progress(0, 0, 0)
         elif kind == "progress":
             self._set_progress(msg[1], msg[2], msg[3])
@@ -1767,6 +2318,8 @@ class ShredPackApp(object):
             self.pw_event.set()
         elif kind == "finished":
             self._finish(msg[1])
+        elif kind == "compress_finished":
+            self._finish_compress(msg[1])
 
     def _set_progress(self, pct, done, total):
         self.progress_var.set(((self.cur_idx - 1) + pct / 100.0) / self.cur_n * 100.0)
@@ -1800,6 +2353,7 @@ class ShredPackApp(object):
             notes.append("Original archive deleted.")
         if any(r["delete_failed"] for r in oks):
             notes.append("The original archive couldn't be deleted.")
+        self.lbl_d_title.config(text="Extraction complete")
         self.lbl_d_sub.config(text=" ".join(notes))
         self.show(self.view_done)
         if self.from_shell:
@@ -1848,12 +2402,27 @@ def main():
             uninstall_menu()
             return
         if a == "--mode" and i + 1 < len(args):
-            mode = args[i + 1] if args[i + 1] in ("dialog", "here", "folder") else "dialog"
+            valid = ("dialog", "here", "folder", "compress-quick", "compress-dialog")
+            mode = args[i + 1] if args[i + 1] in valid else "dialog"
             i += 2
             continue
         if not a.startswith("--"):
             files.append(os.path.abspath(a))
         i += 1
+
+    if mode in ("compress-quick", "compress-dialog"):
+        existing = [f for f in files if os.path.exists(f)]
+        root = make_root(False)
+        if not existing:
+            root.withdraw()
+            messagebox.showerror(APP_NAME, "The selected item couldn't be found:\n\n%s"
+                                 % (files[0] if files else "?"))
+            root.destroy()
+            return
+        app = ShredPackApp(root, from_shell=True)
+        app.open_compress(existing, mode)
+        root.mainloop()
+        return
 
     if files:
         existing = [f for f in files if os.path.isfile(f)]
@@ -1877,8 +2446,9 @@ def main():
                 "The right-click option is out of date or points to a different copy of ShredPack.\n\n"
                 "Update it to use this copy?"
                 if state == "stale" else
-                'Add "%s" to the Windows right-click menu for archive files?\n\n'
-                "You'll get: Extract files...  /  Extract Here  /  Extract to folder.\n"
+                'Add "%s" to the Windows right-click menu?\n\n'
+                "On archive files: Extract files...  /  Extract Here.\n"
+                "On any other file or folder: Add to ZIP  /  Add to archive...\n\n"
                 "This only changes settings for your user account and needs no administrator rights."
                 % APP_NAME
             )
@@ -1887,8 +2457,9 @@ def main():
                     install_menu()
                     messagebox.showinfo(
                         APP_NAME,
-                        'Done! Right-click any archive and choose "%s".\n\n'
-                        'On Windows 11 it appears under "Show more options".' % APP_NAME,
+                        'Done! Right-click an archive and choose "%s" to extract it, '
+                        'or right-click any file or folder and choose "%s" to compress it.\n\n'
+                        'On Windows 11 both appear under "Show more options".' % (APP_NAME, APP_NAME),
                         parent=root)
                 except OSError as exc:
                     messagebox.showerror(APP_NAME, "Couldn't update the registry:\n\n%s" % exc, parent=root)
