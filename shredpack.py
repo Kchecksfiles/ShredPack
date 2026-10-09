@@ -18,9 +18,12 @@ import os
 import re
 import sys
 import bz2
+import fnmatch
 import gzip
+import hashlib
 import json
 import lzma
+import posixpath
 import queue
 import shutil
 import struct
@@ -72,7 +75,7 @@ except ImportError:
 # Constants
 # --------------------------------------------------------------------------
 APP_NAME = "ShredPack"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MENU_KEY = "ShredPack"
 COMPRESS_MENU_KEY = "ShredPackCompress"
 # Registry classes the "Add to..." submenu is installed under: any file, and
@@ -82,8 +85,8 @@ COMPRESS_CLASSES = ("*", "Directory")
 # Point this at a raw text file you publish containing just the latest version
 # string (e.g. "1.1.0"), such as a raw GitHub URL to a VERSION.txt in your repo.
 # Leave blank to disable the update check entirely.
-VERSION_URL = ""
-RELEASES_URL = "https://github.com/"  # shown to the user when an update exists
+VERSION_URL = "https://raw.githubusercontent.com/Kchecksfiles/ShredPack/main/VERSION.txt"
+RELEASES_URL = "https://github.com/Kchecksfiles/ShredPack/releases"  # opened from the update link
 
 EXTENSIONS = (
     ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz",
@@ -100,6 +103,12 @@ MIN_FREE_MARGIN = 1.05  # require 5% headroom beyond the estimated output size
 
 LOG_MAX_BYTES = 512 * 1024
 
+# Ask before compressing anything bigger than this (the scan stops counting once
+# either limit is reached, so even a huge selection is checked instantly).
+CONFIRM_FILES = 100000
+CONFIRM_BYTES = 5 * 1024 ** 3
+BROWSE_LIMIT = 20000  # rows shown in the archive browser at once (search narrows the rest)
+
 # (registry sub-key name, menu text, mode). Explorer sorts sub-items by key name.
 # "Extract Here" always creates a new folder named after the archive right next
 # to it (see compute_dest) - there's no separate flat-extract option, to avoid
@@ -107,6 +116,7 @@ LOG_MAX_BYTES = 512 * 1024
 MENU_ITEMS = (
     ("1extract", "Extract files...", "dialog"),
     ("2here", "Extract Here", "here"),
+    ("3test", "Test archive", "test"),
 )
 
 # The "Add to..." submenu shown on ordinary files and folders (not archives).
@@ -161,6 +171,13 @@ class Cancelled(Exception):
 # --------------------------------------------------------------------------
 # Generic helpers
 # --------------------------------------------------------------------------
+def fmt_mtime(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
+    except (OverflowError, ValueError, OSError):
+        return ""
+
+
 def shorten(text, limit):
     return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
@@ -487,12 +504,30 @@ def enable_dark_titlebar(root):
 # Extraction engine (pure Python - no external programs)
 # --------------------------------------------------------------------------
 class Ctx(object):
-    """Progress reporting, cancellation and password holder for one extraction."""
+    """Progress, cancellation, password and per-run options for one operation.
 
-    def __init__(self, cancel, on_progress, password=None):
+    selected   - None, or a set of lowercase archive paths ("dir/file.txt"); a
+                 folder path selects everything beneath it
+    include /
+    exclude    - lists of lowercase wildcard patterns (e.g. "*.jpg")
+    dry_run    - read and verify everything but write nothing (Test Archive)
+    overwrite  - what to do when a file already exists at the destination:
+                 "rename" | "overwrite" | "skip" | "newer"
+    notes      - human-readable remarks collected along the way
+    """
+
+    def __init__(self, cancel, on_progress, password=None, selected=None,
+                 include=None, exclude=None, dry_run=False, overwrite="rename"):
         self.cancel = cancel
         self.on_progress = on_progress
         self.password = password
+        self.selected = selected
+        self.include = [p.lower() for p in (include or [])]
+        self.exclude = [p.lower() for p in (exclude or [])]
+        self.dry_run = dry_run
+        self.overwrite = overwrite
+        self.notes = []
+        self.files = 0
         self.total = 0
         self.done = 0
         self._last = 0.0
@@ -523,13 +558,52 @@ class Ctx(object):
             self.done = self.total
         self._emit(True)
 
+    def wants(self, parts, is_dir=False):
+        """Should the archive member with these path components be processed?"""
+        low = "/".join(parts).lower()
+        if self.selected is not None:
+            if not any(low == s or low.startswith(s + "/") for s in self.selected):
+                return False
+        if is_dir:
+            # With include patterns active, folders appear only as needed to hold files.
+            return not self.include
+        name = parts[-1].lower()
+        if self.include and not any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(low, p)
+                                    for p in self.include):
+            return False
+        if self.exclude and any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(low, p)
+                                for p in self.exclude):
+            return False
+        return True
+
+
+def parse_patterns(text):
+    """'*.jpg, *.png;*.pdf' -> ['*.jpg', '*.png', '*.pdf']"""
+    return [p.strip() for p in re.split(r"[,;\n]+", text or "") if p.strip()]
+
 
 def make_dir(stage, parts):
     os.makedirs(lp(os.path.join(stage, *parts)), exist_ok=True)
 
 
 def write_member(stage, parts, src, ctx, raw=None, raw_size=1):
-    """Stream `src` into stage/parts. Progress by bytes, or by raw file position."""
+    """Stream `src` into stage/parts. Progress by bytes, or by raw file position.
+    Returns the written path, or None if the member was filtered out or this is
+    a dry run (in which case the data is still fully read, so CRC and
+    decompression errors surface)."""
+    if not ctx.wants(parts):
+        return None
+    if ctx.dry_run:
+        while True:
+            chunk = src.read(CHUNK)
+            if not chunk:
+                break
+            if raw is not None:
+                ctx.set_position(raw.tell(), raw_size)
+            else:
+                ctx.add(len(chunk))
+        ctx.files += 1
+        return None
     target = os.path.join(stage, *parts)
     os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
     with open(lp(target), "wb") as dst:
@@ -542,6 +616,7 @@ def write_member(stage, parts, src, ctx, raw=None, raw_size=1):
                 ctx.set_position(raw.tell(), raw_size)
             else:
                 ctx.add(len(chunk))
+    ctx.files += 1
     return target
 
 
@@ -592,7 +667,10 @@ def _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=False):
             if not parts:
                 continue
             if is_dir_entry(info):
-                make_dir(stage, parts)
+                if not ctx.dry_run and ctx.wants(parts, True):
+                    make_dir(stage, parts)
+                continue
+            if not ctx.wants(parts):
                 continue
             try:
                 with zf.open(info, pwd=pw if info.flag_bits & 0x1 else None) as src:
@@ -609,11 +687,12 @@ def _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=False):
                 if encrypted and pw is not None:
                     raise NeedPassword(True)
                 raise
-            try:
-                ts = time.mktime(tuple(info.date_time) + (0, 0, -1))
-                os.utime(lp(target), (ts, ts))
-            except (OverflowError, ValueError, OSError):
-                pass
+            if target:
+                try:
+                    ts = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                    os.utime(lp(target), (ts, ts))
+                except (OverflowError, ValueError, OSError):
+                    pass
     finally:
         if not already_open:
             zf.close()
@@ -681,21 +760,93 @@ def join_split_parts(parts, workdir):
 
 
 # ---- TAR (plain, .gz, .bz2, .xz) --------------------------------------------
+def _set_mtime(path, mtime):
+    try:
+        os.utime(lp(path), (mtime, mtime))
+    except (OverflowError, ValueError, OSError):
+        pass
+
+
+def _resolve_link(parts, member):
+    """Archive-relative key of the file a TAR link points at, or None if it
+    points outside the archive (absolute or ../ escapes are never followed)."""
+    target = member.linkname.replace("\\", "/")
+    if member.islnk():
+        resolved = posixpath.normpath(target)
+    else:
+        if target.startswith("/"):
+            return None
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname("/".join(parts)), target))
+    if resolved.startswith("..") or resolved.startswith("/"):
+        return None
+    cleaned = clean_parts(resolved)
+    return "/".join(cleaned).lower() if cleaned else None
+
+
 def extract_tar(path, stage, ctx):
+    """Extract a TAR (plain or compressed). Regular files and folders are
+    extracted with their timestamps. Symbolic/hard links are never created as
+    real links (that can be abused to write outside the destination); when a
+    link points at a regular file inside the same archive, that file's
+    contents are copied to the link's location instead. Anything else
+    (devices, links to folders, dangling links) is skipped and reported."""
     size = max(1, os.path.getsize(path))
+    written = {}      # "a/b.txt" (lowercase) -> staged file path
+    pending = []      # (parts, member) links to resolve once all files exist
+    special = 0
     with open(path, "rb") as raw:
-        with tarfile.open(fileobj=raw, mode="r|*") as tf:
+        # Not stream mode ("r|*"): that skips the gzip trailer CRC, so a corrupted
+        # .tar.gz could extract without any complaint. Draining to EOF below makes
+        # the decompressor verify its checksum.
+        with tarfile.open(fileobj=raw, mode="r:*") as tf:
             for member in tf:
                 parts = clean_parts(member.name)
                 if not parts:
                     continue
                 if member.isdir():
-                    make_dir(stage, parts)
+                    if not ctx.dry_run and ctx.wants(parts, True):
+                        make_dir(stage, parts)
                 elif member.isreg():
                     src = tf.extractfile(member)
                     if src is not None:
-                        write_member(stage, parts, src, ctx, raw, size)
+                        target = write_member(stage, parts, src, ctx, raw, size)
+                        if target:
+                            _set_mtime(target, member.mtime)
+                            written["/".join(parts).lower()] = target
+                elif member.issym() or member.islnk():
+                    if ctx.wants(parts):
+                        pending.append((parts, member))
+                else:
+                    special += 1
                 ctx.set_position(raw.tell(), size)
+            stream = tf.fileobj
+            while stream is not None and stream.read(CHUNK):
+                ctx._check()
+
+    skipped = special
+    if not ctx.dry_run:
+        progress = True
+        while pending and progress:
+            progress = False
+            for item in list(pending):
+                parts, member = item
+                key = _resolve_link(parts, member)
+                if key is None:
+                    continue
+                source = written.get(key)
+                if not source:
+                    continue
+                dest = os.path.join(stage, *parts)
+                os.makedirs(lp(os.path.dirname(dest)), exist_ok=True)
+                shutil.copyfile(lp(source), lp(dest))
+                _set_mtime(dest, member.mtime)
+                written["/".join(parts).lower()] = dest
+                pending.remove(item)
+                progress = True
+        skipped += len(pending)
+    if skipped:
+        ctx.notes.append(
+            "%d link(s) or special file(s) couldn't be restored and were skipped." % skipped)
 
 
 # ---- single-file .gz / .bz2 / .xz ---------------------------------------------
@@ -711,6 +862,36 @@ def extract_single(path, stage, ctx):
         else:
             src = lzma.LZMAFile(raw)
         write_member(stage, [archive_stem(path)], src, ctx, raw, size)
+
+
+def sanitize_stage(stage, ctx=None):
+    """Clean a folder written by a library that doesn't sanitise names itself
+    (py7zr): strip bidi-override and invalid characters, defuse reserved
+    Windows names, and delete any symbolic links. Returns links removed."""
+    removed = 0
+    for root, dirs, files in os.walk(lp(stage), topdown=False):
+        for name in files + dirs:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.remove(full)
+                except OSError:
+                    try:
+                        os.rmdir(full)
+                    except OSError:
+                        pass
+                removed += 1
+                continue
+            cleaned = "_".join(clean_parts(name)) or "_"
+            if cleaned != name:
+                try:
+                    os.rename(full, os.path.join(root, os.path.basename(
+                        unique_file_path(root, cleaned))))
+                except OSError:
+                    pass
+    if removed and ctx is not None:
+        ctx.notes.append("%d symbolic link(s) in the archive were not restored." % removed)
+    return removed
 
 
 # ---- 7Z (py7zr) ---------------------------------------------------------------
@@ -741,10 +922,26 @@ def extract_7z(path, stage, ctx):
             if z.needs_password() and not pw:
                 raise NeedPassword(False)
             try:
-                ctx.total = max(1, sum(f.uncompressed for f in z.list() if not f.is_directory))
+                file_infos = [f for f in z.list() if not f.is_directory]
+                ctx.total = max(1, sum(f.uncompressed for f in file_infos))
             except Exception:  # noqa: BLE001
-                ctx.total = 0
-            z.extractall(path=stage, callback=Progress())
+                file_infos, ctx.total = [], 0
+            if ctx.dry_run:
+                if z.test() is False:
+                    raise ArchiveError("The archive failed its integrity check - its data is corrupted.")
+                ctx.files = len(file_infos)
+                return
+            if ctx.selected is not None or ctx.include or ctx.exclude:
+                names = [n for n in z.getnames() if ctx.wants(clean_parts(n) or ["_"])]
+                if not names:
+                    raise ArchiveError("Nothing in the archive matches the selection or filters.")
+                try:
+                    z.extract(path=stage, targets=names, callback=Progress())
+                except TypeError:  # older py7zr without callback support on extract()
+                    z.extract(path=stage, targets=names)
+            else:
+                z.extractall(path=stage, callback=Progress())
+        sanitize_stage(stage, ctx)
     except (Cancelled, NeedPassword, ArchiveError):
         raise
     except Exception as exc:  # noqa: BLE001
@@ -758,50 +955,65 @@ def extract_7z(path, stage, ctx):
 
 
 # ---- ISO (pycdlib) ------------------------------------------------------------
+def _iso_facade(iso):
+    if iso.has_udf():
+        return iso.get_udf_facade()
+    if iso.has_joliet():
+        return iso.get_joliet_facade()
+    if iso.has_rock_ridge():
+        return iso.get_rock_ridge_facade()
+    return iso.get_iso9660_facade()
+
+
+def _iso_collect(facade):
+    """-> (folder paths, [(file path, length)]) as stored in the image."""
+    dirs, files = [], []
+    for dirname, dirlist, filelist in facade.walk("/"):
+        base = dirname if dirname.endswith("/") else dirname + "/"
+        for d in dirlist:
+            dirs.append(base + d)
+        for fn in filelist:
+            full = base + fn
+            try:
+                length = int(facade.get_record(full).get_data_length())
+            except Exception:  # noqa: BLE001
+                length = 0
+            files.append((full, length))
+    return dirs, files
+
+
+def _iso_parts(stored_path):
+    return clean_parts(re.sub(r";\d+$", "", stored_path))
+
+
 def extract_iso(path, stage, ctx):
     if pycdlib is None:
         raise Unsupported("ISO support isn't included in this build (the pycdlib package is missing).")
     iso = pycdlib.PyCdlib()
     iso.open(path)
     try:
-        if iso.has_udf():
-            facade = iso.get_udf_facade()
-        elif iso.has_joliet():
-            facade = iso.get_joliet_facade()
-        elif iso.has_rock_ridge():
-            facade = iso.get_rock_ridge_facade()
-        else:
-            facade = iso.get_iso9660_facade()
+        facade = _iso_facade(iso)
+        dirs, files = _iso_collect(facade)
+        files = [(f, n) for f, n in files if (_iso_parts(f) and ctx.wants(_iso_parts(f)))]
+        ctx.total = max(1, sum(n for _f, n in files))
 
-        dirs, files = [], []
-        total = 0
-        for dirname, dirlist, filelist in facade.walk("/"):
-            base = dirname if dirname.endswith("/") else dirname + "/"
-            for d in dirlist:
-                dirs.append(base + d)
-            for fn in filelist:
-                full = base + fn
-                try:
-                    length = int(facade.get_record(full).get_data_length())
-                except Exception:  # noqa: BLE001
-                    length = 0
-                total += length
-                files.append((full, length))
-        ctx.total = max(1, total)
-
-        for d in dirs:
-            parts = clean_parts(re.sub(r";\d+$", "", d))
-            if parts:
-                make_dir(stage, parts)
+        if not ctx.dry_run:
+            for d in dirs:
+                parts = _iso_parts(d)
+                if parts and ctx.wants(parts, True):
+                    make_dir(stage, parts)
         for full, length in files:
             ctx._check()
-            parts = clean_parts(re.sub(r";\d+$", "", full))
-            if not parts:
-                continue
-            target = os.path.join(stage, *parts)
-            os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
-            with open(lp(target), "wb") as out:
-                facade.get_file_from_iso_fp(out, full)
+            parts = _iso_parts(full)
+            if ctx.dry_run:
+                with open(os.devnull, "wb") as out:
+                    facade.get_file_from_iso_fp(out, full)
+            else:
+                target = os.path.join(stage, *parts)
+                os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
+                with open(lp(target), "wb") as out:
+                    facade.get_file_from_iso_fp(out, full)
+            ctx.files += 1
             ctx.add(length)
     finally:
         try:
@@ -811,6 +1023,24 @@ def extract_iso(path, stage, ctx):
 
 
 # ---- CAB (stored + MSZIP) -----------------------------------------------------
+def _cab_csum(buf, seed=0):
+    """The cabinet-format block checksum: XOR of little-endian 32-bit words,
+    with a trailing 1-3 bytes folded in as a partial word."""
+    cs = seed
+    full = len(buf) & ~3
+    for (word,) in struct.iter_unpack("<I", buf[:full]):
+        cs ^= word
+    tail = buf[full:]
+    ul = 0
+    if len(tail) == 3:
+        ul = (tail[0] << 16) | (tail[1] << 8) | tail[2]
+    elif len(tail) == 2:
+        ul = (tail[0] << 8) | tail[1]
+    elif len(tail) == 1:
+        ul = tail[0]
+    return cs ^ ul
+
+
 class CabReader(object):
     """Sequential reader over the uncompressed stream of one CAB folder."""
 
@@ -830,12 +1060,14 @@ class CabReader(object):
         hdr = self.f.read(8)
         if len(hdr) < 8:
             raise ArchiveError("The CAB file is truncated or corrupted.")
-        _csum, cb_data, _cb_uncomp = struct.unpack("<IHH", hdr)
+        csum, cb_data, _cb_uncomp = struct.unpack("<IHH", hdr)
         if self.data_res:
             self.f.read(self.data_res)
         data = self.f.read(cb_data)
         if len(data) < cb_data:
             raise ArchiveError("The CAB file is truncated or corrupted.")
+        if csum and _cab_csum(data, _cab_csum(hdr[4:8])) != csum:
+            raise ArchiveError("The CAB file is corrupted (a data block failed its checksum).")
         if self.method == 0:
             out = data
         else:
@@ -871,7 +1103,9 @@ def _read_asciiz(f):
         out.extend(b)
 
 
-def extract_cab(path, stage, ctx):
+def _cab_parse(path):
+    """-> (folders, files, cb_data_res). folders: [(data offset, n blocks, method)];
+    files: [(name, size, offset in folder, folder index, dos date, dos time)]."""
     with open(path, "rb") as f:
         hdr = f.read(36)
         if len(hdr) < 36 or hdr[:4] != b"MSCF":
@@ -899,10 +1133,23 @@ def extract_cab(path, stage, ctx):
         f.seek(coff_files)
         files = []
         for _ in range(n_files):
-            cb_file, uoff, ifolder, _date, _time, attribs = struct.unpack("<IIHHHH", f.read(16))
+            cb_file, uoff, ifolder, fdate, ftime, attribs = struct.unpack("<IIHHHH", f.read(16))
             raw_name = _read_asciiz(f)
             name = raw_name.decode("utf-8" if attribs & 0x80 else "cp437", "replace")
-            files.append((name, cb_file, uoff, ifolder))
+            files.append((name, cb_file, uoff, ifolder, fdate, ftime))
+    return folders, files, cb_data_res
+
+
+def _dos_datetime(fdate, ftime):
+    try:
+        return time.mktime((1980 + (fdate >> 9), (fdate >> 5) & 15, fdate & 31,
+                            ftime >> 11, (ftime >> 5) & 63, (ftime & 31) * 2, 0, 0, -1))
+    except (OverflowError, ValueError):
+        return None
+
+
+def extract_cab(path, stage, ctx):
+    folders, files, cb_data_res = _cab_parse(path)
 
     if any(x[3] >= 0xFFFD for x in files):
         raise Unsupported("Multi-part cabinets (split across several .cab files) aren't supported.")
@@ -921,19 +1168,21 @@ def extract_cab(path, stage, ctx):
         reader = CabReader(path, coff, n_data, method, cb_data_res)
         try:
             pos = 0
-            for name, cb_file, uoff, _ in group:
+            for name, cb_file, uoff, _ifolder, fdate, ftime in group:
                 if uoff < pos:
                     raise ArchiveError("The CAB file has overlapping entries and can't be read.")
                 reader.skip(uoff - pos)
                 pos = uoff
                 parts = clean_parts(name)
                 remaining = cb_file
-                if parts:
-                    target = os.path.join(stage, *parts)
-                    os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
-                    dst = open(lp(target), "wb")
-                else:
-                    dst = None
+                target = None
+                dst = None
+                if parts and ctx.wants(parts):
+                    ctx.files += 1
+                    if not ctx.dry_run:
+                        target = os.path.join(stage, *parts)
+                        os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
+                        dst = open(lp(target), "wb")
                 try:
                     while remaining > 0:
                         chunk = reader.read(min(CHUNK, remaining))
@@ -946,6 +1195,10 @@ def extract_cab(path, stage, ctx):
                 finally:
                     if dst is not None:
                         dst.close()
+                if target:
+                    ts = _dos_datetime(fdate, ftime)
+                    if ts:
+                        _set_mtime(target, ts)
                 pos += cb_file
         finally:
             reader.close()
@@ -986,50 +1239,57 @@ class XarStream(object):
             self.pending = self.dec.decompress(raw) if self.dec else raw
 
 
+def _xar_parse(f):
+    """-> (entries, heap offset). entries: [(parts, 'dir'|'file', offset, length, style, size)]"""
+    hdr = f.read(28)
+    if len(hdr) < 28 or hdr[:4] != b"xar!":
+        raise ArchiveError("This isn't a valid XAR file.")
+    _magic, header_size, _ver, toc_c, _toc_u, _alg = struct.unpack(">4sHHQQI", hdr)
+    f.seek(header_size)
+    toc = zlib.decompress(f.read(toc_c))
+    heap = header_size + toc_c
+    toc_el = ET.fromstring(toc).find("toc")
+    if toc_el is None:
+        raise ArchiveError("The XAR table of contents is missing or corrupted.")
+
+    entries = []
+
+    def walk(element, prefix):
+        for fe in element.findall("file"):
+            parts = prefix + clean_parts(fe.findtext("name") or "")
+            kind = fe.findtext("type") or "file"
+            data = fe.find("data")
+            if kind == "directory":
+                entries.append((parts, "dir", 0, 0, "", 0))
+            elif kind == "file":
+                if data is not None:
+                    enc = data.find("encoding")
+                    entries.append((
+                        parts, "file",
+                        int(data.findtext("offset") or 0),
+                        int(data.findtext("length") or 0),
+                        enc.get("style", "") if enc is not None else "",
+                        int(data.findtext("size") or 0),
+                    ))
+                else:
+                    entries.append((parts, "file", 0, 0, "", 0))
+            walk(fe, parts)
+
+    walk(toc_el, [])
+    return entries, heap
+
+
 def extract_xar(path, stage, ctx):
     with open(path, "rb") as f:
-        hdr = f.read(28)
-        if len(hdr) < 28 or hdr[:4] != b"xar!":
-            raise ArchiveError("This isn't a valid XAR file.")
-        _magic, header_size, _ver, toc_c, _toc_u, _alg = struct.unpack(">4sHHQQI", hdr)
-        f.seek(header_size)
-        toc = zlib.decompress(f.read(toc_c))
-        heap = header_size + toc_c
-        toc_el = ET.fromstring(toc).find("toc")
-        if toc_el is None:
-            raise ArchiveError("The XAR table of contents is missing or corrupted.")
-
-        entries = []
-
-        def walk(element, prefix):
-            for fe in element.findall("file"):
-                parts = prefix + clean_parts(fe.findtext("name") or "")
-                kind = fe.findtext("type") or "file"
-                data = fe.find("data")
-                if kind == "directory":
-                    entries.append((parts, "dir", 0, 0, "", 0))
-                elif kind == "file":
-                    if data is not None:
-                        enc = data.find("encoding")
-                        entries.append((
-                            parts, "file",
-                            int(data.findtext("offset") or 0),
-                            int(data.findtext("length") or 0),
-                            enc.get("style", "") if enc is not None else "",
-                            int(data.findtext("size") or 0),
-                        ))
-                    else:
-                        entries.append((parts, "file", 0, 0, "", 0))
-                walk(fe, parts)
-
-        walk(toc_el, [])
+        entries, heap = _xar_parse(f)
         ctx.total = max(1, sum(e[5] for e in entries if e[1] == "file"))
         for parts, kind, off, length, style, _size in entries:
             if not parts:
                 continue
             if kind == "dir":
-                make_dir(stage, parts)
-            else:
+                if not ctx.dry_run and ctx.wants(parts, True):
+                    make_dir(stage, parts)
+            elif ctx.wants(parts):
                 write_member(stage, parts, XarStream(f, heap + off, length, style), ctx)
 
 
@@ -1080,36 +1340,64 @@ def detect_format(path):
     raise Unsupported("ShredPack doesn't recognise this file as a supported archive.")
 
 
-def merge_into(src, dst, rel=""):
-    """Move everything from the staging folder into dst; never overwrite existing
-    files. Returns the list of final file paths (relative to the top-level dst)
-    that were newly placed, for Mark-of-the-Web propagation."""
+OVERWRITE_POLICIES = (
+    ("rename", "Keep both (rename the new file)"),
+    ("overwrite", "Overwrite the existing file"),
+    ("skip", "Skip - keep the existing file"),
+    ("newer", "Overwrite only if the new file is newer"),
+)
+
+
+def merge_into(src, dst, rel="", policy="rename", stats=None):
+    """Move everything from the staging folder into dst. `policy` decides what
+    happens when a file already exists there (see OVERWRITE_POLICIES). Returns
+    the list of final file paths (relative to the top-level dst) that were
+    newly placed, for Mark-of-the-Web propagation. `stats` (a dict) collects
+    'skipped' and 'replaced' counts."""
+    if stats is None:
+        stats = {}
     placed = []
     for entry in os.scandir(lp(src)):
+        staged = os.path.join(src, entry.name)
         target = os.path.join(dst, entry.name)
         rel_name = os.path.join(rel, entry.name) if rel else entry.name
         if entry.is_dir(follow_symlinks=False):
             if os.path.isdir(lp(target)):
-                placed.extend(merge_into(os.path.join(src, entry.name), target, rel_name))
+                placed.extend(merge_into(staged, target, rel_name, policy, stats))
             elif os.path.exists(lp(target)):
                 renamed = unique_path(dst, entry.name)
-                os.rename(lp(os.path.join(src, entry.name)), lp(renamed))
+                os.rename(lp(staged), lp(renamed))
                 placed.extend(
                     os.path.join(rel, os.path.basename(renamed), r) if rel
                     else os.path.join(os.path.basename(renamed), r)
                     for r in _list_all_files(renamed)
                 )
             else:
-                os.rename(lp(os.path.join(src, entry.name)), lp(target))
-                placed.extend(
-                    os.path.join(rel_name, r) for r in _list_all_files(target)
-                )
-        else:
-            if os.path.exists(lp(target)):
-                target = unique_file_path(dst, entry.name)
-                rel_name = os.path.join(rel, os.path.basename(target)) if rel else os.path.basename(target)
-            os.rename(lp(os.path.join(src, entry.name)), lp(target))
-            placed.append(rel_name)
+                os.rename(lp(staged), lp(target))
+                placed.extend(os.path.join(rel_name, r) for r in _list_all_files(target))
+            continue
+
+        if os.path.exists(lp(target)) and not os.path.isdir(lp(target)):
+            replace = policy == "overwrite"
+            if policy == "newer":
+                try:
+                    replace = os.path.getmtime(lp(staged)) > os.path.getmtime(lp(target)) + 2
+                except OSError:
+                    replace = False
+            if policy in ("skip", "newer") and not replace:
+                os.remove(lp(staged))
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                continue
+            if replace:
+                os.replace(lp(staged), lp(target))
+                stats["replaced"] = stats.get("replaced", 0) + 1
+                placed.append(rel_name)
+                continue
+        if os.path.exists(lp(target)):
+            target = unique_file_path(dst, entry.name)
+            rel_name = os.path.join(rel, os.path.basename(target)) if rel else os.path.basename(target)
+        os.rename(lp(staged), lp(target))
+        placed.append(rel_name)
     try:
         os.rmdir(lp(src))
     except OSError:
@@ -1147,7 +1435,15 @@ def extract_archive(path, dest, ctx, motw_source=None):
         stage = tempfile.mkdtemp(prefix=".shredpack_", dir=dest)
         handler(path, stage, ctx)
         ctx.finish()
-        placed = merge_into(stage, dest)
+        stats = {}
+        placed = merge_into(stage, dest, policy=ctx.overwrite, stats=stats)
+        filtered = ctx.selected is not None or ctx.include or ctx.exclude
+        if filtered and not placed and not stats:
+            raise ArchiveError("Nothing in the archive matches the selection or filters.")
+        if stats.get("skipped"):
+            ctx.notes.append("%d existing file(s) were kept (skipped)." % stats["skipped"])
+        if stats.get("replaced"):
+            ctx.notes.append("%d existing file(s) were overwritten." % stats["replaced"])
         if motw_source:
             propagate_mark_of_the_web(motw_source, dest, placed)
     except BaseException:
@@ -1161,6 +1457,202 @@ def extract_archive(path, dest, ctx, motw_source=None):
         raise
     else:
         shutil.rmtree(lp(stage), ignore_errors=True)
+
+
+def test_archive(path, ctx):
+    """Read every entry of the archive - decompressing and verifying CRCs - and
+    write nothing to disk. Raises on the first problem; on success ctx.files
+    holds the number of files verified."""
+    ctx.dry_run = True
+    handler = HANDLERS[detect_format(path)]
+    scratch = tempfile.mkdtemp(prefix=".shredpack_test_")
+    try:
+        handler(path, scratch, ctx)
+        ctx.finish()
+    finally:
+        shutil.rmtree(lp(scratch), ignore_errors=True)
+
+
+FORMAT_LABELS = {
+    "zip": "ZIP", "tar": "TAR", "single": "Compressed file", "7z": "7-Zip",
+    "iso": "ISO image", "cab": "CAB (Windows cabinet)", "xar": "XAR",
+}
+
+
+def _to_timestamp(value):
+    """Best-effort conversion of the assorted timestamp types libraries hand out."""
+    try:
+        if value is None:
+            return None
+        if hasattr(value, "totimestamp"):
+            return float(value.totimestamp())
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+        return float(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _entry(parts, size, packed, mtime, is_dir, encrypted=False):
+    return {"path": "/".join(parts), "size": size, "packed": packed,
+            "mtime": mtime, "is_dir": is_dir, "encrypted": encrypted}
+
+
+def list_archive(path, password=None):
+    """Read an archive's table of contents without extracting anything.
+    Returns {'format': key, 'entries': [...], 'encrypted': bool}; each entry has
+    path, size, packed (None if unknown), mtime (None if unknown), is_dir,
+    encrypted. Raises NeedPassword for archives whose listing is encrypted."""
+    fmt = detect_format(path)
+    entries, encrypted = [], False
+
+    if fmt == "zip":
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                parts = clean_parts(info.filename)
+                if not parts or is_junk(info.filename):
+                    continue
+                enc = bool(info.flag_bits & 0x1)
+                encrypted = encrypted or enc
+                try:
+                    mtime = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                except (OverflowError, ValueError):
+                    mtime = None
+                entries.append(_entry(parts, info.file_size, info.compress_size, mtime,
+                                      is_dir_entry(info), enc))
+
+    elif fmt == "tar":
+        with open(path, "rb") as raw:
+            with tarfile.open(fileobj=raw, mode="r:*") as tf:
+                for m in tf:
+                    parts = clean_parts(m.name)
+                    if not parts or not (m.isdir() or m.isreg() or m.issym() or m.islnk()):
+                        continue
+                    entries.append(_entry(parts, m.size if m.isreg() else 0, None,
+                                          m.mtime, m.isdir()))
+
+    elif fmt == "single":
+        entries.append(_entry([archive_stem(path)], None, os.path.getsize(path),
+                              os.path.getmtime(path), False))
+
+    elif fmt == "7z":
+        if py7zr is None:
+            raise Unsupported("7Z support isn't included in this build (the py7zr package is missing).")
+        try:
+            with py7zr.SevenZipFile(path, mode="r", password=password or None) as z:
+                encrypted = bool(z.needs_password())
+                for f in z.list():
+                    parts = clean_parts(f.filename)
+                    if not parts:
+                        continue
+                    entries.append(_entry(
+                        parts, None if f.is_directory else f.uncompressed,
+                        None if f.is_directory else getattr(f, "compressed", None),
+                        _to_timestamp(getattr(f, "lastwritetime", None)
+                                      or getattr(f, "creationtime", None)),
+                        bool(f.is_directory), encrypted))
+        except (Cancelled, NeedPassword, ArchiveError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if exc.__class__.__name__ == "PasswordRequired":
+                raise NeedPassword(False)
+            if password and "password" in (str(exc) + exc.__class__.__name__).lower():
+                raise NeedPassword(True)
+            raise
+
+    elif fmt == "iso":
+        if pycdlib is None:
+            raise Unsupported("ISO support isn't included in this build (the pycdlib package is missing).")
+        iso = pycdlib.PyCdlib()
+        iso.open(path)
+        try:
+            dirs, files = _iso_collect(_iso_facade(iso))
+        finally:
+            iso.close()
+        for d in dirs:
+            parts = _iso_parts(d)
+            if parts:
+                entries.append(_entry(parts, 0, None, None, True))
+        for full, length in files:
+            parts = _iso_parts(full)
+            if parts:
+                entries.append(_entry(parts, length, None, None, False))
+
+    elif fmt == "cab":
+        _folders, files, _res = _cab_parse(path)
+        for name, size, _off, _fi, fdate, ftime in files:
+            parts = clean_parts(name)
+            if parts:
+                entries.append(_entry(parts, size, None, _dos_datetime(fdate, ftime), False))
+
+    elif fmt == "xar":
+        with open(path, "rb") as f:
+            xar_entries, _heap = _xar_parse(f)
+        for parts, kind, _off, length, _style, size in xar_entries:
+            if parts:
+                entries.append(_entry(parts, size if kind == "file" else 0,
+                                      length if kind == "file" else None, None, kind == "dir"))
+
+    entries.sort(key=lambda e: e["path"].lower())
+    return {"format": fmt, "entries": entries, "encrypted": encrypted}
+
+
+def summarize_listing(listing, path):
+    files = [e for e in listing["entries"] if not e["is_dir"]]
+    folders = [e for e in listing["entries"] if e["is_dir"]]
+    sizes = [e["size"] for e in files if e["size"] is not None]
+    total = sum(sizes) if sizes and len(sizes) == len(files) else None
+    packed = os.path.getsize(path)
+    return {
+        "format": FORMAT_LABELS.get(listing["format"], listing["format"]),
+        "files": len(files), "folders": len(folders),
+        "total": total, "packed": packed,
+        "ratio": (packed * 100.0 / total) if total else None,
+        "encrypted": listing["encrypted"],
+    }
+
+
+def describe_summary(s):
+    bits = [s["format"], "%d file%s" % (s["files"], "" if s["files"] == 1 else "s")]
+    if s["folders"]:
+        bits.append("%d folder%s" % (s["folders"], "" if s["folders"] == 1 else "s"))
+    if s["total"] is not None:
+        bits.append("%s unpacked" % fmt_size(s["total"]))
+    bits.append("%s on disk" % fmt_size(s["packed"]))
+    if s["ratio"] is not None:
+        bits.append("%.0f%% of original" % s["ratio"])
+    if s["encrypted"]:
+        bits.append("encrypted")
+    return "  \u2022  ".join(bits)
+
+
+HASH_ALGOS = (("sha256", "SHA-256"), ("sha1", "SHA-1"), ("md5", "MD5"), ("crc32", "CRC32"))
+
+
+def compute_hashes(path, ctx):
+    """One pass over the file -> {'sha256': hex, 'sha1': hex, 'md5': hex, 'crc32': hex}."""
+    sha256, sha1 = hashlib.sha256(), hashlib.sha1()
+    try:
+        md5 = hashlib.md5()
+    except ValueError:  # FIPS-restricted Python builds
+        md5 = None
+    crc = 0
+    ctx.total = max(1, os.path.getsize(path))
+    with open(lp(path), "rb") as f:
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            sha256.update(chunk)
+            sha1.update(chunk)
+            if md5 is not None:
+                md5.update(chunk)
+            crc = zlib.crc32(chunk, crc)
+            ctx.add(len(chunk))
+    ctx.finish()
+    return {"sha256": sha256.hexdigest(), "sha1": sha1.hexdigest(),
+            "md5": md5.hexdigest() if md5 is not None else "unavailable",
+            "crc32": "%08x" % (crc & 0xFFFFFFFF)}
 
 
 def describe_error(exc):
@@ -1198,25 +1690,76 @@ def compress_format_available(key):
     return True
 
 
-def compress_members(sources):
+def _is_link_or_reparse(path):
+    """True for symlinks and Windows junctions/reparse points, which are never
+    followed or archived (they could pull in files from outside the folder
+    the user picked)."""
+    try:
+        if os.path.islink(path):
+            return True
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attrs & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        return True
+
+
+def compress_members(sources, skipped=None):
     """Yield (arcname, abs_path, is_dir) for the given top-level sources,
     recursing into folders. A folder source becomes the archive's own root
     folder (name/...); a lone file keeps just its name; several sources are
-    each added at the top level under their own name."""
+    each added at the top level under their own name. Links and junctions are
+    skipped (their paths are appended to `skipped` if given)."""
+    def skip(p):
+        if skipped is not None:
+            skipped.append(p)
+
     for src in sources:
+        if _is_link_or_reparse(src):
+            skip(src)
+            continue
         name = sanitize_name(os.path.basename(os.path.normpath(src))) or "item"
         if os.path.isdir(src):
             yield (name, src, True)
             for root, dirs, files in os.walk(src):
+                keep = []
+                for d in dirs:
+                    if _is_link_or_reparse(os.path.join(root, d)):
+                        skip(os.path.join(root, d))
+                    else:
+                        keep.append(d)
+                dirs[:] = keep
                 rel_root = os.path.relpath(root, src)
                 arc_root = name if rel_root == "." else "/".join(
                     [name] + clean_parts(rel_root))
-                for d in dirs:
+                for d in keep:
                     yield (arc_root + "/" + sanitize_name(d), os.path.join(root, d), True)
                 for f in files:
-                    yield (arc_root + "/" + sanitize_name(f), os.path.join(root, f), False)
+                    full = os.path.join(root, f)
+                    if _is_link_or_reparse(full):
+                        skip(full)
+                        continue
+                    yield (arc_root + "/" + sanitize_name(f), full, False)
         else:
             yield (name, src, False)
+
+
+def scan_sources(sources, max_files=None, max_bytes=None):
+    """Count what a compression would include, stopping early once either cap
+    is reached (so a stray 'compress my whole drive' can't freeze the window).
+    -> (files, bytes, skipped_links, capped)"""
+    files = total = 0
+    skipped = []
+    for _arc, path, is_dir in compress_members(sources, skipped):
+        if is_dir:
+            continue
+        files += 1
+        try:
+            total += os.path.getsize(lp(path))
+        except OSError:
+            pass
+        if (max_files and files >= max_files) or (max_bytes and total >= max_bytes):
+            return files, total, skipped, True
+    return files, total, skipped, False
 
 
 def default_archive_name(sources, ext):
@@ -1229,8 +1772,25 @@ def default_archive_name(sources, ext):
     return (sanitize_name(stem) or "Archive") + ext
 
 
-def compress_zip(sources, dest, ctx, password=None):
-    members = list(compress_members(sources))
+COMPRESS_LEVELS = (
+    ("store", "Store (no compression)"),
+    ("fast", "Fast"),
+    ("normal", "Normal"),
+    ("max", "Maximum"),
+)
+_DEFLATE_LEVEL = {"fast": 1, "normal": 6, "max": 9}
+
+
+def _gather_members(sources, ctx):
+    skipped = []
+    members = list(compress_members(sources, skipped))
+    if skipped:
+        ctx.notes.append("%d link(s)/junction(s) were skipped, not followed." % len(skipped))
+    return members
+
+
+def compress_zip(sources, dest, ctx, password=None, level="normal"):
+    members = _gather_members(sources, ctx)
     ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
 
     if password:
@@ -1259,7 +1819,11 @@ def compress_zip(sources, dest, ctx, password=None):
             except OSError:
                 dt = time.localtime()[:6]
             info = zipfile.ZipInfo(arcname, date_time=dt)
-            info.compress_type = zipfile.ZIP_DEFLATED
+            if level == "store":
+                info.compress_type = zipfile.ZIP_STORED
+            else:
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info._compresslevel = _DEFLATE_LEVEL.get(level, 6)
             with open(lp(path), "rb") as src, zf.open(info, "w") as dst:
                 while True:
                     chunk = src.read(CHUNK)
@@ -1284,10 +1848,16 @@ class _ProgressReader(object):
         return data
 
 
-def compress_tar(sources, dest, mode, ctx):
-    members = list(compress_members(sources))
+def compress_tar(sources, dest, mode, ctx, level="normal"):
+    members = _gather_members(sources, ctx)
     ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
-    with tarfile.open(dest, mode) as tf:
+    kwargs = {}
+    if mode in ("w:gz", "w:bz2"):
+        kwargs["compresslevel"] = {"store": 1, "fast": 1, "normal": 6 if mode == "w:gz" else 9,
+                                   "max": 9}.get(level, 6)
+    elif mode == "w:xz":
+        kwargs["preset"] = {"store": 0, "fast": 1, "normal": 6, "max": 9}.get(level, 6)
+    with tarfile.open(dest, mode, **kwargs) as tf:
         added_dirs = set()
         for arcname, path, is_dir in members:
             ctx._check()
@@ -1306,40 +1876,28 @@ def compress_tar(sources, dest, mode, ctx):
     ctx.finish()
 
 
-def compress_7z(sources, dest, ctx, password=None):
+def compress_7z(sources, dest, ctx, password=None, level="normal"):
     if py7zr is None:
         raise Unsupported(
             "7Z creation needs the py7zr package, which isn't included in this build."
         )
-    total = 0
-    for s in sources:
-        if os.path.isdir(s):
-            for root, _d, files in os.walk(s):
-                for f in files:
-                    try:
-                        total += os.path.getsize(os.path.join(root, f))
-                    except OSError:
-                        pass
-        else:
-            try:
-                total += os.path.getsize(s)
-            except OSError:
-                pass
-    ctx.total = max(1, total)
-    # py7zr doesn't expose fine-grained write progress, so this jumps once done
-    # rather than streaming - the progress bar will sit until the write finishes.
-    with py7zr.SevenZipFile(dest, "w", password=password) as z:
-        for s in sources:
-            name = sanitize_name(os.path.basename(os.path.normpath(s))) or "item"
+    members = _gather_members(sources, ctx)
+    ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
+    kwargs = {}
+    if level == "store":
+        kwargs["filters"] = [{"id": py7zr.FILTER_COPY}]
+    elif level in ("fast", "max"):
+        kwargs["filters"] = [{"id": py7zr.FILTER_LZMA2, "preset": 1 if level == "fast" else 9}]
+    with py7zr.SevenZipFile(dest, "w", password=password, **kwargs) as z:
+        for arcname, path, is_dir in members:
             ctx._check()
-            if os.path.isdir(s):
-                z.writeall(s, arcname=name)
-            else:
-                z.write(s, arcname=name)
+            z.write(path, arcname)
+            if not is_dir:
+                ctx.add(os.path.getsize(path))
     ctx.finish()
 
 
-def compress_archive(sources, dest, fmt_key, ctx, password=None):
+def compress_archive(sources, dest, fmt_key, ctx, password=None, level="normal"):
     """Create `dest` from `sources` (files/folders). Writes to a temp sibling
     file first so a failed or cancelled run never leaves a broken archive
     where the real one should be."""
@@ -1347,11 +1905,11 @@ def compress_archive(sources, dest, fmt_key, ctx, password=None):
     tmp = dest + ".part"
     try:
         if fmt_key == "zip":
-            compress_zip(sources, tmp, ctx, password)
+            compress_zip(sources, tmp, ctx, password, level)
         elif fmt_key == "7z":
-            compress_7z(sources, tmp, ctx, password)
+            compress_7z(sources, tmp, ctx, password, level)
         else:
-            compress_tar(sources, tmp, fmt[3], ctx)
+            compress_tar(sources, tmp, fmt[3], ctx, level)
         os.replace(lp(tmp), lp(dest))
     except BaseException:
         try:
@@ -1510,6 +2068,14 @@ class ShredPackApp(object):
         self.compress_sources = []
         self._name_dirty = False
         self._suppress_name_trace = False
+        self.selection = None          # set of lowercase archive paths chosen in the browser
+        self.initial_password = None   # password already entered while browsing
+        self.listing = None
+        self.auto_test = False         # right-click "Test archive": run the test straight away
+        self.browse_password = None
+        self._poll_active = False
+        self._filter_job = None
+        self._browse_rows = []
 
         root.title(APP_NAME)
         root.configure(bg=BG)
@@ -1520,9 +2086,10 @@ class ShredPackApp(object):
                 root.iconbitmap(default=icon_path)
             except tk.TclError:
                 pass
-        w, h = self.px(580), self.px(520)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
+        w = self.px(600)
+        h = min(self.px(680), sh - self.px(90))
+        root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, max(0, (sh - h) // 3)))
 
         self._build_styles()
         self._build_ui()
@@ -1545,7 +2112,8 @@ class ShredPackApp(object):
         root.lift()
         root.focus_force()
 
-        check_for_update(self._on_update_result)
+        if not from_shell:
+            check_for_update(self._on_update_result)
 
     def _on_update_result(self, latest):
         if latest:
@@ -1576,6 +2144,28 @@ class ShredPackApp(object):
         s.configure("Zen.Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
                     bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, borderwidth=0,
                     thickness=self.px(6))
+        s.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
+                    borderwidth=0, rowheight=self.px(24), font=(FONT, 10))
+        s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#08222e")])
+        s.configure("Treeview.Heading", background="#3a3a3a", foreground=TEXT, borderwidth=0,
+                    relief="flat", font=(FONT_SEMI, 9), padding=(self.px(6), self.px(5)))
+        s.map("Treeview.Heading", background=[("active", "#454545")])
+        s.configure("Vertical.TScrollbar", background="#3a3a3a", troughcolor=CARD,
+                    bordercolor=CARD, arrowcolor=TEXT, relief="flat", borderwidth=0)
+        s.configure("TCombobox", fieldbackground=FIELD, background="#3a3a3a", foreground=TEXT,
+                    arrowcolor=TEXT, bordercolor=BORDER, lightcolor=FIELD, darkcolor=FIELD)
+        s.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)],
+              selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", TEXT)])
+        self.root.option_add("*TCombobox*Listbox.background", FIELD)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#08222e")
+
+    def _entry(self, parent, var, **kw):
+        e = tk.Entry(parent, textvariable=var, font=(FONT, 10), bg=FIELD, fg=TEXT,
+                     insertbackground=TEXT, relief="flat", highlightthickness=1,
+                     highlightbackground=BORDER, highlightcolor=ACCENT, **kw)
+        return e
 
     def _card(self, parent):
         card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -1608,6 +2198,7 @@ class ShredPackApp(object):
         self._build_home(body)
         self._build_choice(body)
         self._build_compress(body)
+        self._build_browse(body)
         self._build_progress(body)
         self._build_done(body)
 
@@ -1634,6 +2225,8 @@ class ShredPackApp(object):
                    command=self.choose_archives).pack(side="left")
         ttk.Button(btn_row, text="Create Archive...", style="Secondary.TButton",
                    command=self.choose_compress_entry).pack(side="left", padx=(px(10), 0))
+        ttk.Button(btn_row, text="Checksum...", style="Secondary.TButton",
+                   command=self.choose_checksum).pack(side="left", padx=(px(10), 0))
         self._label(inner, FORMATS_LABEL, 8, color="#7c7c7c").pack(pady=(px(12), 0))
 
         tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(16), px(12)))
@@ -1654,6 +2247,12 @@ class ShredPackApp(object):
                    command=self.cancel_choice).pack(side="right")
         ttk.Button(bottom, text="Extract", style="Primary.TButton",
                    command=self.begin).pack(side="right", padx=(0, px(10)))
+        self.btn_test = ttk.Button(bottom, text="Test", style="Secondary.TButton",
+                                   command=self.test_selected)
+        self.btn_test.pack(side="left")
+        self.btn_browse = ttk.Button(bottom, text="Browse...", style="Secondary.TButton",
+                                     command=self.open_browser)
+        self.btn_browse.pack(side="left", padx=(px(8), 0))
 
         self.lbl_name = self._label(inner, "", 14, True, TEXT, anchor="w", justify="left",
                                     wraplength=px(480))
@@ -1685,10 +2284,35 @@ class ShredPackApp(object):
         self.lbl_hint = self._label(self.dest_area, "", 10, anchor="w", justify="left",
                                     wraplength=px(480))
 
+        self.lbl_sel = self._label(inner, "", 10, color=ACCENT, anchor="w", justify="left",
+                                   wraplength=px(480))
+
         self.delete_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(inner, text="Delete original archive after successful extraction",
                         variable=self.delete_var, style="Zen.TCheckbutton"
                         ).pack(anchor="w", pady=(px(14), 0))
+
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(14), px(8)))
+        ow_row = tk.Frame(inner, bg=CARD)
+        ow_row.pack(fill="x")
+        self._label(ow_row, "If a file already exists", 10, anchor="w").pack(side="left")
+        self.overwrite_var = tk.StringVar(value=OVERWRITE_POLICIES[0][1])
+        ttk.Combobox(ow_row, textvariable=self.overwrite_var, state="readonly",
+                     values=[label for _k, label in OVERWRITE_POLICIES], width=34
+                     ).pack(side="right")
+        flt = tk.Frame(inner, bg=CARD)
+        flt.pack(fill="x", pady=(px(8), 0))
+        self._label(flt, "Only extract", 10, anchor="w").grid(row=0, column=0, sticky="w")
+        self._label(flt, "Skip", 10, anchor="w").grid(row=0, column=1, sticky="w", padx=(px(10), 0))
+        self.include_var = tk.StringVar()
+        self.exclude_var = tk.StringVar()
+        self._entry(flt, self.include_var).grid(row=1, column=0, sticky="ew", ipady=px(5))
+        self._entry(flt, self.exclude_var).grid(row=1, column=1, sticky="ew", ipady=px(5),
+                                                padx=(px(10), 0))
+        flt.columnconfigure(0, weight=1)
+        flt.columnconfigure(1, weight=1)
+        self._label(inner, "Wildcards, e.g. *.jpg, *.pdf  (leave empty to extract everything)", 8,
+                    color="#7c7c7c", anchor="w").pack(fill="x", pady=(px(3), 0))
 
     def _build_compress(self, body):
         px = self.px
@@ -1723,6 +2347,15 @@ class ShredPackApp(object):
             values=[f[1] for f in COMPRESS_FORMATS if compress_format_available(f[0])], width=16)
         self.fmt_combo.pack(side="right")
         self.fmt_combo.bind("<<ComboboxSelected>>", lambda e: self._on_format_change())
+
+        lvl_row = tk.Frame(inner, bg=CARD)
+        lvl_row.pack(fill="x", pady=(px(8), 0))
+        self._label(lvl_row, "Compression level", 10, anchor="w").pack(side="left")
+        self.compress_level_var = tk.StringVar(value=COMPRESS_LEVELS[2][1])
+        self.level_combo = ttk.Combobox(
+            lvl_row, textvariable=self.compress_level_var, state="readonly",
+            values=[label for _k, label in COMPRESS_LEVELS], width=22)
+        self.level_combo.pack(side="right")
 
         self._label(inner, "Archive name", 10, anchor="w").pack(fill="x", pady=(px(12), 0))
         name_row = tk.Frame(inner, bg=CARD)
@@ -1759,6 +2392,51 @@ class ShredPackApp(object):
             bg=FIELD, fg=TEXT, insertbackground=TEXT, relief="flat", highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=ACCENT, state="disabled")
         self.pw_entry.pack(fill="x", pady=(px(6), 0), ipady=px(7))
+
+    def _build_browse(self, body):
+        px = self.px
+        self.view_browse, inner = self._card(body)
+        bottom = tk.Frame(inner, bg=CARD)
+        bottom.pack(side="bottom", fill="x", pady=(px(10), 0))
+        ttk.Button(bottom, text="Back", style="Secondary.TButton",
+                   command=self.browse_back).pack(side="left")
+        ttk.Button(bottom, text="Extract All...", style="Secondary.TButton",
+                   command=lambda: self.browse_extract(False)).pack(side="right")
+        ttk.Button(bottom, text="Extract Selected...", style="Primary.TButton",
+                   command=lambda: self.browse_extract(True)).pack(side="right", padx=(0, px(8)))
+
+        self.lbl_b_name = self._label(inner, "", 13, True, TEXT, anchor="w", justify="left",
+                                      wraplength=px(500))
+        self.lbl_b_name.pack(fill="x")
+        self.lbl_b_info = self._label(inner, "", 9, anchor="w", justify="left", wraplength=px(500))
+        self.lbl_b_info.pack(fill="x", pady=(px(2), px(8)))
+
+        search_row = tk.Frame(inner, bg=CARD)
+        search_row.pack(fill="x")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self._schedule_browse_filter())
+        self._entry(search_row, self.search_var).pack(side="left", fill="x", expand=True,
+                                                      ipady=px(5))
+        self.lbl_b_count = self._label(search_row, "", 9, anchor="e")
+        self.lbl_b_count.pack(side="right", padx=(px(8), 0))
+
+        tree_frame = tk.Frame(inner, bg=CARD)
+        tree_frame.pack(fill="both", expand=True, pady=(px(8), 0))
+        self.tree = ttk.Treeview(tree_frame, columns=("size", "packed", "modified"),
+                                 selectmode="extended")
+        self.tree.heading("#0", text="Name", anchor="w")
+        self.tree.heading("size", text="Size", anchor="e")
+        self.tree.heading("packed", text="Packed", anchor="e")
+        self.tree.heading("modified", text="Modified", anchor="w")
+        self.tree.column("#0", width=px(240), stretch=True)
+        self.tree.column("size", width=px(75), anchor="e", stretch=False)
+        self.tree.column("packed", width=px(75), anchor="e", stretch=False)
+        self.tree.column("modified", width=px(120), stretch=False)
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview,
+                               style="Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
 
     def _build_progress(self, body):
         px = self.px
@@ -1798,7 +2476,7 @@ class ShredPackApp(object):
             self._register_dnd(child)
 
     def show(self, view):
-        for v in (self.view_home, self.view_choice, self.view_compress,
+        for v in (self.view_home, self.view_choice, self.view_compress, self.view_browse,
                   self.view_progress, self.view_done):
             v.pack_forget()
         view.pack(fill="both", expand=True)
@@ -1808,6 +2486,8 @@ class ShredPackApp(object):
         self.state = "home"
         self.action = "extract"
         self.archives = []
+        self.selection = None
+        self.initial_password = None
         if sys.platform == "win32":
             self.refresh_menu_status()
         else:
@@ -1863,13 +2543,20 @@ class ShredPackApp(object):
             return False
 
     def _on_drop(self, event):
-        if self.state != "home":
+        if self.state not in ("home", "compress_choice"):
             return getattr(event, "action", "copy")
         try:
             paths = [p for p in self.root.tk.splitlist(event.data) if os.path.exists(p)]
         except tk.TclError:
             paths = []
         if not paths:
+            return getattr(event, "action", "copy")
+        if self.state == "compress_choice":
+            for p in paths:
+                p = os.path.abspath(p)
+                if p not in self.compress_sources:
+                    self.compress_sources.append(p)
+            self.refresh_compress()
             return getattr(event, "action", "copy")
         files_only = [p for p in paths if os.path.isfile(p)]
         all_archives = (
@@ -1899,9 +2586,14 @@ class ShredPackApp(object):
             resolved.append(f)
         self.archives = resolved
         self.mode = mode
+        self.selection = None
+        self.initial_password = None
         self.dest_var.set(os.path.dirname(self.archives[0]))
         self.sub_var.set(False)
         self.delete_var.set(False)
+        self.overwrite_var.set(OVERWRITE_POLICIES[0][1])
+        self.include_var.set("")
+        self.exclude_var.set("")
         self.state = "choice"
         self.refresh_choice()
         self.show(self.view_choice)
@@ -1937,6 +2629,15 @@ class ShredPackApp(object):
             self.lbl_hint.config(text="\u2192  " + hint)
             self.lbl_hint.pack(fill="x")
 
+        self.lbl_sel.pack_forget()
+        if self.selection:
+            n = len(self.selection)
+            self.lbl_sel.config(text="Extracting only the %d item%s you selected in the browser."
+                                % (n, "" if n == 1 else "s"))
+            self.lbl_sel.pack(fill="x", pady=(px(8), 0))
+        single = len(self.archives) == 1 and not detect_split_parts(first)
+        self.btn_browse.state(["!disabled"] if single else ["disabled"])
+
     def pick_folder(self):
         if self.state != "choice":
             return
@@ -1966,6 +2667,7 @@ class ShredPackApp(object):
         self.encrypt_var.set(False)
         self.pw_entry.config(state="disabled")
         self.compress_fmt_var.set("ZIP")
+        self.compress_level_var.set(COMPRESS_LEVELS[2][1])
         self.state = "compress_choice"
         self.refresh_compress()
         self.show(self.view_compress)
@@ -1975,10 +2677,27 @@ class ShredPackApp(object):
         single click the way WinRAR's own 'Add to <name>.zip' entry does -
         safe to skip confirmation because it only ever creates a new file
         (never overwrites or deletes anything)."""
+        if not self._confirm_large([source]):
+            if self.from_shell:
+                self.root.destroy()
+            else:
+                self.go_home()
+            return
         dest_dir = os.path.dirname(source)
         dest_path = unique_file_path(dest_dir, default_archive_name([source], ".zip"))
         self.compress_sources = [source]
         self._start_compress_job([source], dest_path, "zip", None)
+
+    def _confirm_large(self, sources):
+        files, size, _skipped, capped = scan_sources(sources, CONFIRM_FILES, CONFIRM_BYTES)
+        if not capped:
+            return True
+        return messagebox.askyesno(
+            APP_NAME,
+            "This is a large job: at least {:,} files / {} so far.\n\n"
+            "Compressing it could take a long time and a lot of disk space. Continue?".format(
+                files, fmt_size(size)),
+            parent=self.root, icon="warning")
 
     def refresh_compress(self):
         n = len(self.compress_sources)
@@ -2106,10 +2825,14 @@ class ShredPackApp(object):
                                  parent=self.root)
             return
 
+        if not self._confirm_large(self.compress_sources):
+            return
+        level_label = self.compress_level_var.get()
+        level = next((k for k, label in COMPRESS_LEVELS if label == level_label), "normal")
         dest_path = unique_file_path(dest_dir, name)
-        self._start_compress_job(list(self.compress_sources), dest_path, fmt[0], password)
+        self._start_compress_job(list(self.compress_sources), dest_path, fmt[0], password, level)
 
-    def _start_compress_job(self, sources, dest_path, fmt_key, password):
+    def _start_compress_job(self, sources, dest_path, fmt_key, password, level="normal"):
         self.action = "compress"
         self.state = "processing"
         self.cancel.clear()
@@ -2119,16 +2842,18 @@ class ShredPackApp(object):
         self.cur_idx, self.cur_n = 1, 1
         self.show(self.view_progress)
         threading.Thread(
-            target=self._compress_worker, args=(sources, dest_path, fmt_key, password), daemon=True,
+            target=self._compress_worker, args=(sources, dest_path, fmt_key, password, level),
+            daemon=True,
         ).start()
-        self.root.after(40, self._poll)
+        self._ensure_poll()
 
-    def _compress_worker(self, sources, dest_path, fmt_key, password):
+    def _compress_worker(self, sources, dest_path, fmt_key, password, level="normal"):
         self.q.put(("file", 1, 1, os.path.basename(dest_path)))
-        result = {"status": "ok", "detail": "", "dest": dest_path}
+        result = {"status": "ok", "detail": "", "dest": dest_path, "notes": []}
         try:
             ctx = Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t)))
-            compress_archive(sources, dest_path, fmt_key, ctx, password)
+            compress_archive(sources, dest_path, fmt_key, ctx, password, level)
+            result["notes"] = list(ctx.notes)
         except Cancelled:
             result["status"] = "cancelled"
         except Exception as exc:  # noqa: BLE001
@@ -2150,12 +2875,299 @@ class ShredPackApp(object):
             return
         self.state = "finished"
         self.lbl_d_title.config(text="Compression complete")
-        self.lbl_d_sub.config(text=os.path.basename(result["dest"]))
+        self.lbl_d_sub.config(text="\n".join([os.path.basename(result["dest"])] + result["notes"]))
         self.show(self.view_done)
+        delay = 1300 if not result["notes"] else 4000
         if self.from_shell:
-            self.root.after(1300, self.root.destroy)
+            self.root.after(delay, self.root.destroy)
         else:
-            self.root.after(1300, self.go_home)
+            self.root.after(delay, self.go_home)
+
+    # ---- test archive ---------------------------------------------------------
+    def test_selected(self):
+        if self.state == "choice":
+            self._start_test(list(self.archives))
+
+    def run_test_now(self, files):
+        """Right-click 'Test archive': skip the options screen and just test."""
+        self.auto_test = True
+        self.open_archives(files, "dialog")
+        self._start_test(list(self.archives))
+
+    def _start_test(self, archives):
+        self.action = "test"
+        self.state = "processing"
+        self.cancel.clear()
+        self.progress_var.set(0)
+        self.lbl_p_title.config(text="Preparing\u2026")
+        self.lbl_p_sub.config(text="")
+        self.cur_idx, self.cur_n = 1, len(archives)
+        self.show(self.view_progress)
+        threading.Thread(target=self._test_worker, args=(archives, self.initial_password),
+                         daemon=True).start()
+        self._ensure_poll()
+
+    def _test_worker(self, archives, initial_password):
+        results = []
+        total = len(archives)
+        for idx, arc in enumerate(archives, 1):
+            if self.cancel.is_set():
+                break
+            name = os.path.basename(arc)
+            self.q.put(("file", idx, total, name))
+            res = {"name": name, "status": "ok", "files": 0, "detail": ""}
+            join_dir = None
+            try:
+                parts = detect_split_parts(arc)
+                source = arc
+                if parts:
+                    join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
+                    source = join_split_parts(parts, join_dir)
+                password = initial_password
+                while True:
+                    ctx = Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t)),
+                              password)
+                    try:
+                        test_archive(source, ctx)
+                        res["files"] = ctx.files
+                        break
+                    except NeedPassword as need:
+                        password = self._ask_password(name, need.retry)
+                        if password is None:
+                            self.cancel.set()
+                            raise Cancelled()
+            except Cancelled:
+                break
+            except Exception as exc:  # noqa: BLE001
+                res["status"] = "error"
+                res["detail"] = describe_error(exc)
+                log_exception("Test failed for %s" % arc)
+            finally:
+                if join_dir:
+                    shutil.rmtree(join_dir, ignore_errors=True)
+            results.append(res)
+        self.q.put(("test_finished", results))
+
+    def _finish_test(self, results):
+        cancelled = self.cancel.is_set()
+        self.state = "choice"
+        bad = [r for r in results if r["status"] == "error"]
+        good = [r for r in results if r["status"] == "ok"]
+        if not cancelled:
+            if bad:
+                text = "\n\n".join("%s\n%s" % (r["name"], r["detail"]) for r in bad)
+                if good:
+                    text += "\n\n%d archive(s) passed." % len(good)
+                messagebox.showerror("%s - Problems found" % APP_NAME, text, parent=self.root)
+            else:
+                n = sum(r["files"] for r in good)
+                messagebox.showinfo(
+                    APP_NAME,
+                    "No errors found.\n\n%d file%s verified in %d archive%s." % (
+                        n, "" if n == 1 else "s", len(good), "" if len(good) == 1 else "s"),
+                    parent=self.root)
+        if self.auto_test:
+            self.root.destroy()
+            return
+        self._back_to_choice_view()
+
+    def _back_to_choice_view(self):
+        self.state = "choice"
+        self.action = "extract"
+        self.refresh_choice()
+        self.show(self.view_choice)
+
+    # ---- archive browser --------------------------------------------------------
+    def open_browser(self):
+        if self.state != "choice" or len(self.archives) != 1:
+            return
+        arc = self.archives[0]
+        if detect_split_parts(arc):
+            messagebox.showinfo(
+                APP_NAME, "Browsing isn't available for split archives yet - use Extract instead.",
+                parent=self.root)
+            return
+        self._start_listing(arc, self.initial_password)
+
+    def _start_listing(self, arc, password):
+        self.action = "list"
+        self.state = "processing"
+        self.cancel.clear()
+        self.progress_var.set(0)
+        self.lbl_p_title.config(text="Reading " + shorten(os.path.basename(arc), 44))
+        self.lbl_p_sub.config(text="Reading the archive's contents\u2026")
+        self.cur_idx, self.cur_n = 1, 1
+        self.show(self.view_progress)
+        threading.Thread(target=self._list_worker, args=(arc, password), daemon=True).start()
+        self._ensure_poll()
+
+    def _list_worker(self, arc, password):
+        try:
+            listing = list_archive(arc, password)
+            self.q.put(("listing_done", arc, password, listing, summarize_listing(listing, arc)))
+        except NeedPassword as need:
+            self.q.put(("listing_password", arc, need.retry))
+        except Exception as exc:  # noqa: BLE001
+            log_exception("Listing failed for %s" % arc)
+            self.q.put(("listing_failed", describe_error(exc)))
+
+    def _on_listing(self, arc, password, listing, summary):
+        if self.cancel.is_set():
+            self._back_to_choice_view()
+            return
+        self.listing = listing
+        self.browse_password = password
+        self.lbl_b_name.config(text=shorten(os.path.basename(arc), 56))
+        self.lbl_b_info.config(text=describe_summary(summary))
+        self.search_var.set("")
+        self.state = "browse"
+        self._browse_filter()
+        self.show(self.view_browse)
+
+    def _schedule_browse_filter(self):
+        if self._filter_job is not None:
+            try:
+                self.root.after_cancel(self._filter_job)
+            except tk.TclError:
+                pass
+        self._filter_job = self.root.after(150, self._browse_filter)
+
+    def _browse_filter(self):
+        self._filter_job = None
+        if not self.listing:
+            return
+        query = self.search_var.get().strip().lower()
+        entries = self.listing["entries"]
+        rows = [i for i, e in enumerate(entries) if not query or query in e["path"].lower()]
+        self._browse_rows = rows
+        self.tree.delete(*self.tree.get_children())
+        shown = rows[:BROWSE_LIMIT]
+        for i in shown:
+            e = entries[i]
+            self.tree.insert("", "end", iid=str(i),
+                             text=e["path"] + ("/" if e["is_dir"] else ""),
+                             values=("" if e["is_dir"] or e["size"] is None else fmt_size(e["size"]),
+                                     "" if e["is_dir"] or e["packed"] is None else fmt_size(e["packed"]),
+                                     fmt_mtime(e["mtime"])))
+        if len(rows) > len(shown):
+            self.lbl_b_count.config(text="First %d of %d" % (len(shown), len(rows)))
+        elif query:
+            self.lbl_b_count.config(text="%d of %d" % (len(rows), len(entries)))
+        else:
+            self.lbl_b_count.config(text="%d items" % len(entries))
+
+    def browse_back(self):
+        self.selection = None
+        self._back_to_choice_view()
+
+    def browse_extract(self, selected_only):
+        if self.state != "browse":
+            return
+        selection = None
+        if selected_only:
+            ids = self.tree.selection()
+            if not ids:
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Select one or more files or folders first (Ctrl- or Shift-click for several).",
+                    parent=self.root)
+                return
+            entries = self.listing["entries"]
+            selection = {entries[int(i)]["path"].lower() for i in ids}
+        self.selection = selection
+        self.initial_password = self.browse_password
+        self._back_to_choice_view()
+
+    # ---- checksums -----------------------------------------------------------------
+    def choose_checksum(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Choose a file to checksum")
+        if path:
+            self._start_hash(os.path.abspath(path))
+
+    def _start_hash(self, path):
+        self.action = "hash"
+        self.state = "processing"
+        self.cancel.clear()
+        self.progress_var.set(0)
+        self.lbl_p_title.config(text="Reading " + shorten(os.path.basename(path), 44))
+        self.lbl_p_sub.config(text="")
+        self.cur_idx, self.cur_n = 1, 1
+        self.show(self.view_progress)
+        threading.Thread(target=self._hash_worker, args=(path,), daemon=True).start()
+        self._ensure_poll()
+
+    def _hash_worker(self, path):
+        self.q.put(("file", 1, 1, os.path.basename(path)))
+        try:
+            ctx = Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t)))
+            self.q.put(("hash_done", path, compute_hashes(path, ctx)))
+        except Cancelled:
+            self.q.put(("hash_done", path, None))
+        except Exception as exc:  # noqa: BLE001
+            log_exception("Checksum failed for %s" % path)
+            self.q.put(("hash_failed", describe_error(exc)))
+
+    def _copy_text(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _show_hashes(self, path, result):
+        self.go_home()
+        px = self.px
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Checksums")
+        dlg.configure(bg=BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        card = tk.Frame(dlg, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
+        inner = tk.Frame(card, bg=CARD)
+        inner.pack(padx=px(20), pady=px(18))
+        self._label(inner, shorten(os.path.basename(path), 50), 13, True, TEXT,
+                    anchor="w").grid(row=0, column=0, columnspan=3, sticky="w")
+        try:
+            size_text = fmt_size(os.path.getsize(path))
+        except OSError:
+            size_text = ""
+        self._label(inner, size_text, 9, anchor="w").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, px(10)))
+        row = 2
+        for key, label in HASH_ALGOS:
+            self._label(inner, label, 10, anchor="w").grid(row=row, column=0, sticky="w", pady=px(3))
+            var = tk.StringVar(value=result[key])
+            tk.Entry(inner, textvariable=var, font=("Consolas", 9), width=66, bg=FIELD, fg=TEXT,
+                     readonlybackground=FIELD, relief="flat", state="readonly",
+                     highlightthickness=1, highlightbackground=BORDER
+                     ).grid(row=row, column=1, padx=px(8), ipady=px(4))
+            ttk.Button(inner, text="Copy", style="Secondary.TButton",
+                       command=lambda v=var: self._copy_text(v.get())
+                       ).grid(row=row, column=2)
+            row += 1
+        self._label(inner, "Compare with a published checksum", 10, anchor="w").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(px(12), 0))
+        cmp_var = tk.StringVar()
+        self._entry(inner, cmp_var, width=66).grid(
+            row=row + 1, column=0, columnspan=3, sticky="ew", ipady=px(5), pady=(px(4), 0))
+        verdict = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(520))
+        verdict.grid(row=row + 2, column=0, columnspan=3, sticky="w", pady=(px(6), 0))
+
+        def on_compare(*_args):
+            text = cmp_var.get().strip().lower().replace(" ", "")
+            if not text:
+                verdict.config(text="", fg=MUTED)
+                return
+            hit = next((lbl for key, lbl in HASH_ALGOS if result[key].lower() == text), None)
+            if hit:
+                verdict.config(text="\u2713 Matches the %s checksum." % hit, fg=GREEN)
+            else:
+                verdict.config(
+                    text="No match. Check that you copied the whole checksum - if it's complete, "
+                         "this file differs from the original.", fg="#ff7b7b")
+
+        cmp_var.trace_add("write", on_compare)
+        ttk.Button(inner, text="Close", style="Primary.TButton", command=dlg.destroy).grid(
+            row=row + 3, column=2, sticky="e", pady=(px(12), 0))
+        enable_dark_titlebar(dlg)
 
     # ---- running ------------------------------------------------------------
     def begin(self):
@@ -2171,10 +3183,29 @@ class ShredPackApp(object):
             subfolder = self.sub_var.get()
         delete = self.delete_var.get()
 
-        if not self._preflight_ok(dest_dir, subfolder):
+        policy_label = self.overwrite_var.get()
+        opts = {
+            "selected": set(self.selection) if self.selection else None,
+            "include": parse_patterns(self.include_var.get()),
+            "exclude": parse_patterns(self.exclude_var.get()),
+            "overwrite": next((k for k, label in OVERWRITE_POLICIES if label == policy_label),
+                              "rename"),
+            "password": self.initial_password,
+        }
+        filtered = bool(opts["selected"] or opts["include"] or opts["exclude"])
+        if filtered and delete:
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "You're extracting only part of the archive.\n\n"
+                    "Delete the original archive anyway? Everything you aren't extracting "
+                    "would be lost.",
+                    parent=self.root, icon="warning", default="no"):
+                delete = False
+        if not filtered and not self._preflight_ok(dest_dir, subfolder):
             return
 
         self.state = "processing"
+        self.action = "extract"
         self.cancel.clear()
         self.progress_var.set(0)
         self.lbl_p_title.config(text="Preparing\u2026")
@@ -2182,10 +3213,10 @@ class ShredPackApp(object):
         self.show(self.view_progress)
         threading.Thread(
             target=self._worker,
-            args=(list(self.archives), self.mode, dest_dir, subfolder, delete),
+            args=(list(self.archives), self.mode, dest_dir, subfolder, delete, opts),
             daemon=True,
         ).start()
-        self.root.after(40, self._poll)
+        self._ensure_poll()
 
     def _preflight_ok(self, dest_dir, subfolder):
         """Warn (and let the user bail out) before extracting anything that
@@ -2226,6 +3257,8 @@ class ShredPackApp(object):
             self.cancel_choice()
         elif self.state == "compress_choice":
             self.cancel_compress()
+        elif self.state == "browse":
+            self.browse_back()
         elif self.state == "processing":
             self.on_cancel()
 
@@ -2240,7 +3273,8 @@ class ShredPackApp(object):
         self.pw_event.wait()
         return self.pw_value
 
-    def _worker(self, archives, mode, dest_dir, subfolder, delete):
+    def _worker(self, archives, mode, dest_dir, subfolder, delete, opts=None):
+        opts = opts or {}
         results = []
         total = len(archives)
         for idx, arc in enumerate(archives, 1):
@@ -2249,7 +3283,7 @@ class ShredPackApp(object):
             name = os.path.basename(arc)
             self.q.put(("file", idx, total, name))
             res = {"path": arc, "name": name, "status": "error", "detail": "",
-                   "deleted": False, "delete_failed": False}
+                   "deleted": False, "delete_failed": False, "notes": []}
             join_dir = None
             try:
                 dest = compute_dest(arc, mode, dest_dir, subfolder)
@@ -2260,12 +3294,16 @@ class ShredPackApp(object):
                     join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
                     source = join_split_parts(parts, join_dir)
 
-                password = None
+                password = opts.get("password")
                 while True:
                     ctx = Ctx(self.cancel,
-                              lambda p, d, t: self.q.put(("progress", p, d, t)), password)
+                              lambda p, d, t: self.q.put(("progress", p, d, t)), password,
+                              selected=opts.get("selected"), include=opts.get("include"),
+                              exclude=opts.get("exclude"),
+                              overwrite=opts.get("overwrite", "rename"))
                     try:
                         extract_archive(source, dest, ctx, motw_source=arc)
+                        res["notes"] = list(ctx.notes)
                         break
                     except NeedPassword as need:
                         password = self._ask_password(name, need.retry)
@@ -2291,20 +3329,48 @@ class ShredPackApp(object):
             results.append(res)
         self.q.put(("finished", results))
 
+    def _ensure_poll(self):
+        if not self._poll_active:
+            self._poll_active = True
+            self._ensure_poll()
+
     def _poll(self):
-        try:
-            while True:
-                self._handle(self.q.get_nowait())
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                msg = self.q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._handle(msg)
+            except Exception:  # noqa: BLE001
+                log_exception("UI handler failed for message %r" % (msg[0],))
+                self._recover_from_error()
+                break
         if self.state == "processing":
             self.root.after(40, self._poll)
+        else:
+            self._poll_active = False
+
+    def _recover_from_error(self):
+        self.state = "home"
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                "Something went wrong.\n\nDetails were saved to:\n%s" % log_path(),
+                parent=self.root)
+        except Exception:  # noqa: BLE001
+            pass
+        if self.from_shell:
+            self.root.destroy()
+        else:
+            self.go_home()
 
     def _handle(self, msg):
         kind = msg[0]
         if kind == "file":
             _, self.cur_idx, self.cur_n, name = msg
-            verb = "Compressing " if self.action == "compress" else "Extracting "
+            verb = {"compress": "Compressing ", "test": "Testing ", "hash": "Reading ",
+                    "list": "Reading "}.get(self.action, "Extracting ")
             self.lbl_p_title.config(text=verb + shorten(name, 44))
             self._set_progress(0, 0, 0)
         elif kind == "progress":
@@ -2320,6 +3386,30 @@ class ShredPackApp(object):
             self._finish(msg[1])
         elif kind == "compress_finished":
             self._finish_compress(msg[1])
+        elif kind == "test_finished":
+            self._finish_test(msg[1])
+        elif kind == "listing_done":
+            self._on_listing(*msg[1:])
+        elif kind == "listing_password":
+            _, arc, retry = msg
+            prompt = ("Wrong password. Try again.\n\n" if retry else "") + (
+                '"%s" has an encrypted file list.\nEnter password:' % shorten(os.path.basename(arc), 40))
+            pw = simpledialog.askstring(APP_NAME, prompt, show="*", parent=self.root)
+            if pw:
+                self._start_listing(arc, pw)
+            else:
+                self._back_to_choice_view()
+        elif kind == "listing_failed":
+            messagebox.showerror("%s - Couldn't read the archive" % APP_NAME, msg[1], parent=self.root)
+            self._back_to_choice_view()
+        elif kind == "hash_done":
+            if msg[2] is None:
+                self.go_home()
+            else:
+                self._show_hashes(msg[1], msg[2])
+        elif kind == "hash_failed":
+            messagebox.showerror("%s - Checksum failed" % APP_NAME, msg[1], parent=self.root)
+            self.go_home()
 
     def _set_progress(self, pct, done, total):
         self.progress_var.set(((self.cur_idx - 1) + pct / 100.0) / self.cur_n * 100.0)
@@ -2353,13 +3443,16 @@ class ShredPackApp(object):
             notes.append("Original archive deleted.")
         if any(r["delete_failed"] for r in oks):
             notes.append("The original archive couldn't be deleted.")
+        for r in oks:
+            notes.extend(r.get("notes", []))
         self.lbl_d_title.config(text="Extraction complete")
-        self.lbl_d_sub.config(text=" ".join(notes))
+        self.lbl_d_sub.config(text="\n".join(notes))
         self.show(self.view_done)
+        delay = 1300 if not notes else 4000
         if self.from_shell:
-            self.root.after(1300, self.root.destroy)
+            self.root.after(delay, self.root.destroy)
         else:
-            self.root.after(1300, self.go_home)
+            self.root.after(delay, self.go_home)
 
     def _back_to_choice(self, results):
         finished = {r["path"] for r in results if r["status"] == "ok"}
@@ -2402,13 +3495,27 @@ def main():
             uninstall_menu()
             return
         if a == "--mode" and i + 1 < len(args):
-            valid = ("dialog", "here", "folder", "compress-quick", "compress-dialog")
+            valid = ("dialog", "here", "folder", "test", "compress-quick", "compress-dialog")
             mode = args[i + 1] if args[i + 1] in valid else "dialog"
             i += 2
             continue
         if not a.startswith("--"):
             files.append(os.path.abspath(a))
         i += 1
+
+    if mode == "test":
+        existing = [f for f in files if os.path.isfile(f)]
+        root = make_root(False)
+        if not existing:
+            root.withdraw()
+            messagebox.showerror(APP_NAME, "The selected file couldn't be found:\n\n%s"
+                                 % (files[0] if files else "?"))
+            root.destroy()
+            return
+        app = ShredPackApp(root, from_shell=True)
+        app.run_test_now(existing)
+        root.mainloop()
+        return
 
     if mode in ("compress-quick", "compress-dialog"):
         existing = [f for f in files if os.path.exists(f)]
