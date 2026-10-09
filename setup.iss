@@ -13,7 +13,11 @@
 ; below and never breaks if the user moves anything.
 
 #define MyAppName "ShredPack"
-#define MyAppVersion "1.0.0"
+; The build workflow passes the real version in with /DMyAppVersion=..., read from
+; APP_VERSION in shredpack.py, so the version only ever lives in one place.
+#ifndef MyAppVersion
+  #define MyAppVersion "1.1.0"
+#endif
 #define MyAppPublisher "ShredPack"
 #define MyAppExeName "ShredPack.exe"
 
