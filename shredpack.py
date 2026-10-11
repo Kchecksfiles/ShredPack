@@ -75,7 +75,7 @@ except ImportError:
 # Constants
 # --------------------------------------------------------------------------
 APP_NAME = "ShredPack"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 MENU_KEY = "ShredPack"
 # Name of the separate compression cascade that v1.1.0 installed; only used now to
 # find and remove it (the commands live in the single "ShredPack" menu).
