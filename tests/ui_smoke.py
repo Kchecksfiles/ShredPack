@@ -194,5 +194,84 @@ app.go_home(); messagebox.showerror.reset_mock()
 app.q.put(("listing_done",)); app.state = "processing"; app._poll()
 check("bad UI message doesn't wedge the app", messagebox.showerror.called and app.state == "home")
 
+# ---- Test archive: Cancel must return the UI to a usable state; messages must be clear ----
+import tempfile as _tempfile
+SCRATCH = fresh("scratch")
+_tempfile.tempdir = SCRATCH          # so leftover temp files from a cancelled run would be visible
+
+
+def pump_until(app, kinds, on_msg=None, timeout=60):
+    end = time.time() + timeout
+    while time.time() < end:
+        try: msg = app.q.get(timeout=0.5)
+        except queue.Empty: continue
+        app._handle(msg)
+        if on_msg: on_msg(msg)
+        if msg[0] in kinds: return msg
+    raise TimeoutError("waiting for %s (state=%s)" % (kinds, app.state))
+
+
+d = fresh("bigtest"); big = os.path.join(d, "big.zip")
+with zipfile.ZipFile(big, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zf.open("huge.bin", "w", force_zip64=True) as w:
+        block = b"\0" * (1 << 20)
+        for _ in range(600): w.write(block)          # 600 MiB once unpacked
+app.go_home(); app.open_archives([big], "dialog")
+messagebox.showinfo.reset_mock(); messagebox.showerror.reset_mock()
+app.test_selected()
+check("UI: a Test run is in progress", app.state == "processing" and app.action == "test")
+mark = {}
+def cancel_at_10(msg):
+    if msg[0] == "progress" and msg[1] >= 10 and "t" not in mark:
+        mark["t"] = time.monotonic(); app.on_cancel()          # the Cancel button
+pump_until(app, {"test_finished"}, cancel_at_10)
+latency = time.monotonic() - mark["t"]
+check("UI: Cancel during a large Test returns to the options screen", app.state == "choice")
+check("UI: ...within a second (%.0f ms)" % (latency * 1000), latency < 1.0)
+check("UI: ...with no result popup", not messagebox.showinfo.called and not messagebox.showerror.called)
+check("UI: ...after showing 'Cancelling'", "Cancelling" in str(app.lbl_p_sub.config.call_args_list))
+check("UI: ...and no temp files left", os.listdir(SCRATCH) == [])
+app.go_home(); app.open_archives([good], "dialog"); app.test_selected(); pump(app, {"test_finished"})
+check("UI: the next Test works normally (cancel flag was reset)",
+      messagebox.showinfo.called and "No errors" in messagebox.showinfo.call_args[0][1])
+
+# cancelling while a split archive is being joined, then checking nothing is left behind
+d = fresh("splitui"); base = os.path.join(d, "s.zip")
+with zipfile.ZipFile(base, "w", zipfile.ZIP_STORED) as zf:
+    zf.writestr("r.bin", os.urandom(60 * (1 << 20)))
+whole = open(base, "rb").read(); os.remove(base)
+step = len(whole) // 3 + 1
+parts = []
+for i in range(3):
+    p = os.path.join(d, "s.zip.%03d" % (i + 1)); open(p, "wb").write(whole[i * step:(i + 1) * step]); parts.append(p)
+old_chunk, sp.CHUNK = sp.CHUNK, 16 * 1024
+messagebox.showinfo.reset_mock(); messagebox.showerror.reset_mock()
+app.go_home(); app.open_archives([parts[0]], "dialog"); app.test_selected()
+fired = {}
+def cancel_first(msg):
+    if msg[0] == "progress" and "t" not in fired:
+        fired["t"] = 1; app.on_cancel()
+try:
+    pump_until(app, {"test_finished"}, cancel_first)
+finally:
+    sp.CHUNK = old_chunk
+check("UI: cancelling a split-archive test returns to the options screen", app.state == "choice")
+check("UI: ...and removes the temporary joined file",
+      not [n for n in os.listdir(SCRATCH) if n.startswith(".shredpack_join_")])
+check("UI: ...with no popup", not messagebox.showinfo.called and not messagebox.showerror.called)
+
+# clear messages
+ez = os.path.join(fresh("emptyui"), "e.zip"); zipfile.ZipFile(ez, "w").close()
+messagebox.showinfo.reset_mock()
+app.go_home(); app.open_archives([ez], "dialog"); app.test_selected(); pump(app, {"test_finished"})
+check("UI: testing an empty ZIP says so instead of failing",
+      messagebox.showinfo.called and "empty" in messagebox.showinfo.call_args[0][1])
+messagebox.showerror.reset_mock()
+app.go_home(); app.open_archives([bad], "dialog"); app.test_selected(); pump(app, {"test_finished"})
+txt = messagebox.showerror.call_args[0][1] if messagebox.showerror.called else ""
+check("UI: a corrupted entry is named, with a CRC explanation", "one.bin" in txt and "CRC" in txt)
+check("UI: ...and the app stays usable", app.state == "choice")
+_tempfile.tempdir = None
+
 print("\nUI SMOKE RESULT: %d/%d" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)
