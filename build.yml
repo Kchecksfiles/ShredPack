@@ -34,6 +34,11 @@ jobs:
       - name: Right-click menu registration and ZIP verification tests
         run: python tests/test_menu_and_zip.py
 
+      # Drives the real app through a stand-in for Tk's event loop, including the
+      # exact launches Explorer's right-click menu performs (Test archive, Add to ZIP).
+      - name: UI event-loop tests
+        run: python tests/test_ui_event_loop.py
+
   build:
     needs: test
     runs-on: windows-latest
