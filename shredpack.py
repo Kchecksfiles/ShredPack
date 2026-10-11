@@ -77,10 +77,18 @@ except ImportError:
 APP_NAME = "ShredPack"
 APP_VERSION = "1.1.0"
 MENU_KEY = "ShredPack"
-COMPRESS_MENU_KEY = "ShredPackCompress"
-# Registry classes the "Add to..." submenu is installed under: any file, and
-# any folder. (Not Directory\Background - see the note in install_menu.)
+# Name of the separate compression cascade that v1.1.0 installed; only used now to
+# find and remove it (the commands live in the single "ShredPack" menu).
+LEGACY_COMPRESS_MENU_KEY = "ShredPackCompress"
+# Registry classes that get the compression-only menu: any file, and any folder.
+# Archives get the combined menu from their own per-extension key instead.
 COMPRESS_CLASSES = ("*", "Directory")
+# On "*" (every file) the compression-only menu would appear a second time on
+# archives, which have their own full menu. Hide it there with an AppliesTo
+# query. If a future Windows build ever mishandles that query (symptom: no
+# ShredPack menu on ordinary files), set this to False - archives then rely on
+# Explorer merging the same-named "ShredPack" verbs instead.
+GENERIC_MENU_EXCLUDES_ARCHIVES = True
 
 # Point this at a raw text file you publish containing just the latest version
 # string (e.g. "1.1.0"), such as a raw GitHub URL to a VERSION.txt in your repo.
@@ -119,11 +127,16 @@ MENU_ITEMS = (
     ("3test", "Test archive", "test"),
 )
 
-# The "Add to..." submenu shown on ordinary files and folders (not archives).
+# The compression commands, shown on ordinary files and folders - and on
+# archives too, as part of their single combined menu (ARCHIVE_MENU_ITEMS).
+# Key names 4/5 keep them after the extraction items in that combined menu.
 COMPRESS_MENU_ITEMS = (
-    ("1addzip", "Add to ZIP", "compress-quick"),
-    ("2addarchive", "Add to archive...", "compress-dialog"),
+    ("4addzip", "Add to ZIP", "compress-quick"),
+    ("5addarchive", "Add to archive...", "compress-dialog"),
 )
+
+# What right-clicking an archive shows: ONE "ShredPack" menu with all five.
+ARCHIVE_MENU_ITEMS = MENU_ITEMS + COMPRESS_MENU_ITEMS
 
 CHUNK = 1024 * 1024
 INVALID_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
@@ -530,6 +543,7 @@ class Ctx(object):
         self.files = 0
         self.total = 0
         self.done = 0
+        self.unit = "bytes"   # "items" when an archive has entries but no data bytes at all
         self._last = 0.0
 
     def _check(self):
@@ -541,7 +555,10 @@ class Ctx(object):
         if force or now - self._last >= 0.05:
             self._last = now
             pct = min(100.0, self.done * 100.0 / self.total) if self.total else 0.0
-            self.on_progress(pct, min(self.done, self.total) if self.total else 0, self.total)
+            if self.unit == "items":
+                self.on_progress(pct, 0, 0)       # no byte counts to show
+            else:
+                self.on_progress(pct, min(self.done, self.total) if self.total else 0, self.total)
 
     def add(self, n):
         self._check()
@@ -637,10 +654,95 @@ def _is_aes_info(info):
     return False
 
 
+VERIFY_CHUNK = 256 * 1024   # small, so progress and Cancel stay responsive
+_ZIP_METHODS = {0: "Stored", 8: "Deflate", 9: "Deflate64", 12: "BZIP2", 14: "LZMA",
+                93: "Zstandard", 95: "XZ", 98: "PPMd"}
+
+
+def _zip_label(info):
+    return shorten(info.filename.replace("\\", "/"), 70)
+
+
+def _verify_zip_entry(zf, info, pw, ctx):
+    """Decompress one ZIP entry in small chunks, checking for cancellation and
+    reporting progress after every chunk, then validate its size and CRC-32.
+    Nothing is written anywhere."""
+    ctx._check()
+    label = _zip_label(info)
+    aes = _is_aes_info(info)
+    crc = size = 0
+    try:
+        with zf.open(info, pwd=pw if info.flag_bits & 0x1 else None) as src:
+            while True:
+                chunk = src.read(VERIFY_CHUNK)
+                if not chunk:
+                    break
+                crc = zlib.crc32(chunk, crc)
+                size += len(chunk)
+                if ctx.unit == "bytes":
+                    ctx.add(len(chunk))     # raises Cancelled; emits progress (throttled)
+                else:
+                    ctx._check()
+    except NotImplementedError:             # (a RuntimeError subclass - must come first)
+        method = info.compress_type
+        name = _ZIP_METHODS.get(method)
+        raise ArchiveError("'%s' uses compression method %d%s, which ShredPack can't read." % (
+            label, method, " (%s)" % name if name else ""))
+    except RuntimeError as exc:             # zipfile: "Bad password for file ..."
+        if "password" in str(exc).lower():
+            raise NeedPassword(pw is not None)
+        raise ArchiveError("'%s' couldn't be read: %s" % (label, exc))
+    except zipfile.BadZipFile as exc:
+        if "CRC" in str(exc):
+            if info.flag_bits & 0x1 and pw is not None:
+                raise NeedPassword(True)    # a wrong ZipCrypto password that slipped past the check byte
+            raise ArchiveError("'%s' is corrupted: its checksum (CRC-32) doesn't match the stored value." % label)
+        raise ArchiveError("'%s' is corrupted: %s" % (label, exc))
+    except (zlib.error, lzma.LZMAError):
+        raise ArchiveError("'%s' is corrupted: its compressed data is damaged." % label)
+    except EOFError:
+        raise ArchiveError("'%s' is truncated: the archive ends before its data does." % label)
+    except OSError as exc:
+        if exc.errno is None:               # bz2 reports bad data as a bare OSError
+            raise ArchiveError("'%s' is corrupted: its compressed data is damaged." % label)
+        raise
+    if size != info.file_size:
+        raise ArchiveError("'%s' is corrupted: expected %d bytes but found %d." % (
+            label, info.file_size, size))
+    if not aes and (crc & 0xFFFFFFFF) != info.CRC:    # AES entries are authenticated instead
+        raise ArchiveError("'%s' is corrupted: its checksum (CRC-32) doesn't match the stored value." % label)
+
+
+def _verify_zip(zf, infos, ctx, pw):
+    """Test Archive for ZIP: every file entry is decompressed and checked."""
+    files = [i for i in infos if not is_dir_entry(i)]
+    data_bytes = sum(i.file_size for i in files)
+    if data_bytes > 0:
+        ctx.total, ctx.unit = data_bytes, "bytes"
+    else:                                   # only empty files: count entries instead
+        ctx.total, ctx.unit = max(1, len(files)), "items"
+    ctx.done = 0
+    ctx._emit(True)                         # show 0% straight away
+    for info in files:
+        ctx._check()                        # between entries - even zero-byte ones
+        _verify_zip_entry(zf, info, pw, ctx)
+        ctx.files += 1
+        if ctx.unit == "items":
+            ctx.add(1)
+    if ctx.files == 0:
+        ctx.notes.append("The archive contains no files.")
+
+
 def extract_zip(path, stage, ctx):
     with zipfile.ZipFile(path) as zf:
-        infos = [i for i in zf.infolist() if not is_junk(i.filename)]
+        all_infos = zf.infolist()
+        ctx._check()
+        # Testing verifies every entry; extracting skips macOS metadata junk.
+        infos = all_infos if ctx.dry_run else [i for i in all_infos if not is_junk(i.filename)]
         if not infos:
+            if ctx.dry_run:
+                ctx.notes.append("The archive is valid but empty - it contains no files.")
+                return
             raise ArchiveError("The archive is empty.")
         encrypted = any(i.flag_bits & 0x1 for i in infos)
         uses_aes = any(_is_aes_info(i) for i in infos)
@@ -661,6 +763,9 @@ def extract_zip(path, stage, ctx):
 
 def _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=False):
     try:
+        if ctx.dry_run:
+            _verify_zip(zf, infos, ctx, pw)
+            return
         ctx.total = max(1, sum(i.file_size for i in infos))
         for info in infos:
             parts = clean_parts(info.filename)
@@ -675,14 +780,14 @@ def _extract_zip_with(zf, infos, stage, ctx, pw, encrypted, already_open=False):
             try:
                 with zf.open(info, pwd=pw if info.flag_bits & 0x1 else None) as src:
                     target = write_member(stage, parts, src, ctx)
+            except NotImplementedError:             # (a RuntimeError subclass - must come first)
+                raise ArchiveError(
+                    "This ZIP uses a compression method ShredPack can't read."
+                )
             except RuntimeError as exc:
                 if "password" in str(exc).lower() or "Bad password" in str(exc):
                     raise NeedPassword(pw is not None)
                 raise
-            except NotImplementedError:
-                raise ArchiveError(
-                    "This ZIP uses a compression method ShredPack can't read."
-                )
             except zipfile.BadZipFile:
                 if encrypted and pw is not None:
                     raise NeedPassword(True)
@@ -749,13 +854,27 @@ def detect_split_parts(path):
     return None
 
 
-def join_split_parts(parts, workdir):
-    """Concatenate split-archive parts into one temp file and return its path."""
+def join_split_parts(parts, workdir, ctx=None):
+    """Concatenate split-archive parts into one temp file and return its path.
+    With a Ctx the copy reports progress and can be cancelled (raising Cancelled;
+    the caller removes `workdir`, partial file included)."""
     joined = os.path.join(workdir, "joined.zip")
+    if ctx is not None:
+        ctx.total = max(1, sum(os.path.getsize(lp(p)) for p in parts))
+        ctx.done = 0
+        ctx._emit(True)
     with open(lp(joined), "wb") as out:
         for part in parts:
             with open(lp(part), "rb") as f:
-                shutil.copyfileobj(f, out, CHUNK)
+                while True:
+                    chunk = f.read(CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    if ctx is not None:
+                        ctx.add(len(chunk))
+    if ctx is not None:
+        ctx._emit(True)
     return joined
 
 
@@ -1951,24 +2070,89 @@ def ext_key(ext):
 
 
 def compress_class_key(cls):
-    return r"Software\Classes\%s\shell\%s" % (cls, COMPRESS_MENU_KEY)
+    """Where the compression-only menu lives for '*' (files) and 'Directory'."""
+    return r"Software\Classes\%s\shell\%s" % (cls, MENU_KEY)
 
 
-def _delete_tree(path):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_ALL_ACCESS) as k:
-            while True:
-                try:
-                    sub = winreg.EnumKey(k, 0)
-                except OSError:
-                    break
-                _delete_tree(path + "\\" + sub)
-    except OSError:
-        return
-    try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
-    except OSError:
-        pass
+def legacy_compress_class_key(cls):
+    return r"Software\Classes\%s\shell\%s" % (cls, LEGACY_COMPRESS_MENU_KEY)
+
+
+def registry_extensions():
+    """Extensions that can actually be registered. A name with two dots such as
+    '.zip.001' never matches in Explorer (its extension is just '.001'), so it is
+    left out when installing - but EXTENSIONS still lists it so any key an older
+    version created for it gets cleaned up."""
+    return [e for e in EXTENSIONS if e.count(".") == 1]
+
+
+def archive_applies_to():
+    """AppliesTo query that matches every file EXCEPT archives (see
+    GENERIC_MENU_EXCLUDES_ARCHIVES)."""
+    return "NOT (" + " OR ".join('System.FileExtension:="%s"' % e for e in registry_extensions()) + ")"
+
+
+class _WinRegistry(object):
+    """The only code that touches the real Windows registry (HKEY_CURRENT_USER).
+    Tests install an in-memory stand-in with the same methods via set_registry()."""
+
+    def set_values(self, path, values):
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_WRITE) as k:
+            for name, value in values.items():
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+
+    def get_value(self, path, name=""):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+                return str(winreg.QueryValueEx(k, name)[0])
+        except OSError:
+            return None
+
+    def key_exists(self, path):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path):
+                return True
+        except OSError:
+            return False
+
+    def subkeys(self, path):
+        names = []
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+                while True:
+                    try:
+                        names.append(winreg.EnumKey(k, len(names)))
+                    except OSError:
+                        break
+        except OSError:
+            pass
+        return names
+
+    def delete_key(self, path):
+        """Delete ONE key (it must have no subkeys left)."""
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+        except OSError:
+            pass
+
+    def notify(self):
+        _notify_shell()
+
+
+_registry_override = None
+
+
+def registry():
+    """The registry in use: None when there isn't one (not Windows)."""
+    if _registry_override is not None:
+        return _registry_override
+    return _WinRegistry() if sys.platform == "win32" else None
+
+
+def set_registry(reg):
+    """Tests only: route all menu registration to a stand-in (None restores normal)."""
+    global _registry_override
+    _registry_override = reg
 
 
 def _notify_shell():
@@ -1978,72 +2162,132 @@ def _notify_shell():
         pass
 
 
-def uninstall_menu():
-    if sys.platform != "win32":
-        return
-    for ext in EXTENSIONS:
-        _delete_tree(ext_key(ext))
+def _owned_by_shredpack(reg, path):
+    """True only if the key at `path` was created by ShredPack (any version), so
+    a same-named key belonging to some other program is never touched.
+      * the cascade layouts (v1.0.x and later) carry MUIVerb = "ShredPack";
+      * the very first layout had a default value mentioning ShredPack and a
+        command line launching it."""
+    if not reg.key_exists(path):
+        return False
+    if reg.get_value(path, "MUIVerb") == APP_NAME:
+        return True
+    default = reg.get_value(path, "") or ""
+    command = reg.get_value(path + "\\command", "") or ""
+    return APP_NAME.lower() in default.lower() and APP_NAME.lower() in command.lower()
+
+
+def _delete_tree(reg, path):
+    for sub in reg.subkeys(path):
+        _delete_tree(reg, path + "\\" + sub)
+    reg.delete_key(path)
+
+
+def _all_menu_paths():
+    """Every key path a ShredPack menu could occupy, current and from older versions."""
+    paths = [ext_key(ext) for ext in EXTENSIONS]            # incl. old '.zip.001'
     for cls in COMPRESS_CLASSES:
-        _delete_tree(compress_class_key(cls))
-    _notify_shell()
+        paths.append(compress_class_key(cls))
+        paths.append(legacy_compress_class_key(cls))
+    return paths
 
 
-def _install_cascade(base, items, icon):
-    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_WRITE) as k:
-        winreg.SetValueEx(k, "MUIVerb", 0, winreg.REG_SZ, APP_NAME)
-        winreg.SetValueEx(k, "SubCommands", 0, winreg.REG_SZ, "")
-        if icon:
-            winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
+def uninstall_menu():
+    """Remove every ShredPack menu key - current and from earlier versions - and
+    nothing else. Keys of other programs are left alone even if they sit in the
+    same place (they're only removed if they're verifiably ours)."""
+    reg = registry()
+    if reg is None:
+        return
+    for path in _all_menu_paths():
+        if _owned_by_shredpack(reg, path):
+            _delete_tree(reg, path)
+    reg.notify()
+
+
+def _current_icon():
+    return '"%s",0' % sys.executable if getattr(sys, "frozen", False) else None
+
+
+def _cascade_plan(base, items, icon, applies_to=None):
+    """[(key path, {value name: value})] for one cascading 'ShredPack' menu."""
+    top = {"MUIVerb": APP_NAME, "SubCommands": ""}
+    if icon:
+        top["Icon"] = icon
+    if applies_to:
+        top["AppliesTo"] = applies_to
+    plan = [(base, top)]
     for name, label, mode in items:
         sub = base + "\\shell\\" + name
-        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_WRITE) as k:
-            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, label)
-        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub + r"\command", 0, winreg.KEY_WRITE) as k:
-            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, menu_command(mode))
+        plan.append((sub, {"": label}))
+        plan.append((sub + "\\command", {"": menu_command(mode)}))
+    return plan
+
+
+def _menu_plan(icon):
+    """The complete set of registry keys a correct installation consists of:
+    one combined menu per archive extension, and the compression-only menu on
+    files ('*', hidden on archives) and folders ('Directory')."""
+    plan = []
+    for ext in registry_extensions():
+        plan.extend(_cascade_plan(ext_key(ext), ARCHIVE_MENU_ITEMS, icon))
+    for cls in COMPRESS_CLASSES:
+        applies = archive_applies_to() if (cls == "*" and GENERIC_MENU_EXCLUDES_ARCHIVES) else None
+        plan.extend(_cascade_plan(compress_class_key(cls), COMPRESS_MENU_ITEMS, icon, applies))
+    return plan
+
+
+def _foreign_blockers(reg):
+    """Spots ShredPack would install into that another program's key occupies."""
+    tops = [p for p, v in _menu_plan(None) if v.get("MUIVerb") == APP_NAME]
+    return [p for p in tops if reg.key_exists(p) and not _owned_by_shredpack(reg, p)]
 
 
 def install_menu():
-    """Create cascading 'ShredPack' submenus: extraction on each archive type,
-    and 'Add to...' compression on any ordinary file or folder."""
-    if sys.platform != "win32":
-        return
-    uninstall_menu()  # also removes any old layout
-    icon = '"%s",0' % sys.executable if getattr(sys, "frozen", False) else None
-    for ext in EXTENSIONS:
-        _install_cascade(ext_key(ext), MENU_ITEMS, icon)
-    for cls in COMPRESS_CLASSES:
-        _install_cascade(compress_class_key(cls), COMPRESS_MENU_ITEMS, icon)
-    _notify_shell()
+    """(Re)install the right-click menus. Safe to run any number of times: it first
+    removes everything of ours - including layouts from older versions - so the
+    result is always exactly one ShredPack menu per file type. Returns a list of
+    warnings (a spot already occupied by another program's key is skipped, never
+    overwritten)."""
+    reg = registry()
+    if reg is None:
+        return []
+    uninstall_menu()
+    blocked = set(_foreign_blockers(reg))     # still there after uninstall -> not ours
+    warnings = ["Skipped %s: it belongs to another program." % p for p in sorted(blocked)]
+    for path, values in _menu_plan(_current_icon()):
+        if any(path == b or path.startswith(b + "\\") for b in blocked):
+            continue
+        reg.set_values(path, values)
+    reg.notify()
+    return warnings
 
 
 def install_state():
-    """'none', 'stale' (old layout or another location) or 'current'."""
-    if sys.platform != "win32":
+    """'none' (nothing of ours), 'stale' (older layout, changed, or another
+    location) or 'current'."""
+    reg = registry()
+    if reg is None:
         return "none"
-    key = ext_key(EXTENSIONS[0]) + "\\shell\\" + MENU_ITEMS[-1][0] + r"\command"
-    compress_key = compress_class_key("*") + "\\shell\\" + COMPRESS_MENU_ITEMS[-1][0] + r"\command"
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
-            value = winreg.QueryValueEx(k, "")[0]
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, compress_key) as k2:
-            value2 = winreg.QueryValueEx(k2, "")[0]
-        current = (
-            str(value).lower() == menu_command(MENU_ITEMS[-1][2]).lower()
-            and str(value2).lower() == menu_command(COMPRESS_MENU_ITEMS[-1][2]).lower()
-        )
-        return "current" if current else "stale"
-    except OSError:
-        pass
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ext_key(EXTENSIONS[0])):
-            return "stale"
-    except OSError:
-        pass
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, compress_class_key("*")):
-            return "stale"
-    except OSError:
+    ours = [p for p in _all_menu_paths() if _owned_by_shredpack(reg, p)]
+    if not ours:
         return "none"
+    legacy = [p for p in ours if p.endswith("\\" + LEGACY_COMPRESS_MENU_KEY)]
+    if legacy:
+        return "stale"
+    blocked = _foreign_blockers(reg)          # another program's key: not ours to judge
+    plan = [(p, v) for p, v in _menu_plan(_current_icon())
+            if not any(p == b or p.startswith(b + "\\") for b in blocked)]
+    for path, values in plan:
+        for name, value in values.items():
+            actual = reg.get_value(path, name)
+            if actual is None or actual.lower() != value.lower():
+                return "stale"
+    # Anything of ours outside the expected layout (e.g. an old '.zip.001' key) is stale too.
+    expected = {p.lower() for p, _v in plan}
+    if any(p.lower() not in expected for p in ours):
+        return "stale"
+    return "current"
 
 
 # --------------------------------------------------------------------------
@@ -2922,7 +3166,9 @@ class ShredPackApp(object):
                 source = arc
                 if parts:
                     join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
-                    source = join_split_parts(parts, join_dir)
+                    source = join_split_parts(
+                        parts, join_dir,
+                        Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t))))
                 password = initial_password
                 while True:
                     ctx = Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t)),
@@ -2930,6 +3176,7 @@ class ShredPackApp(object):
                     try:
                         test_archive(source, ctx)
                         res["files"] = ctx.files
+                        res["notes"] = list(ctx.notes)
                         break
                     except NeedPassword as need:
                         password = self._ask_password(name, need.retry)
@@ -2961,11 +3208,12 @@ class ShredPackApp(object):
                 messagebox.showerror("%s - Problems found" % APP_NAME, text, parent=self.root)
             else:
                 n = sum(r["files"] for r in good)
-                messagebox.showinfo(
-                    APP_NAME,
-                    "No errors found.\n\n%d file%s verified in %d archive%s." % (
-                        n, "" if n == 1 else "s", len(good), "" if len(good) == 1 else "s"),
-                    parent=self.root)
+                text = "No errors found.\n\n%d file%s verified in %d archive%s." % (
+                    n, "" if n == 1 else "s", len(good), "" if len(good) == 1 else "s")
+                notes = [note for r in good for note in r.get("notes", [])]
+                if notes:
+                    text += "\n\n" + "\n".join(notes)
+                messagebox.showinfo(APP_NAME, text, parent=self.root)
         if self.auto_test:
             self.root.destroy()
             return
@@ -3292,7 +3540,9 @@ class ShredPackApp(object):
                 source = arc
                 if parts:
                     join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
-                    source = join_split_parts(parts, join_dir)
+                    source = join_split_parts(
+                        parts, join_dir,
+                        Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t))))
 
                 password = opts.get("password")
                 while True:
