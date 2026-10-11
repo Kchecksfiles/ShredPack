@@ -3582,7 +3582,7 @@ class ShredPackApp(object):
     def _ensure_poll(self):
         if not self._poll_active:
             self._poll_active = True
-            self._ensure_poll()
+            self.root.after(40, self._poll)
 
     def _poll(self):
         while True:
