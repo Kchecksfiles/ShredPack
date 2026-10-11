@@ -90,13 +90,24 @@ jobs:
             Out-File -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
 
+      # Fail the build right here if anything is missing, instead of publishing an empty release.
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          foreach ($f in "dist/ShredPack.exe", "Output/ShredPack-Setup.exe", "SHA256SUMS.txt") {
+            if (-not (Test-Path $f)) { Write-Error "Missing build output: $f"; exit 1 }
+            "{0}  ({1:N1} MB)" -f $f, ((Get-Item $f).Length / 1MB)
+          }
+
+      # Forward slashes on purpose: these are glob patterns, and a backslash in a glob is an
+      # escape character, not a folder separator (so 'dist\ShredPack.exe' can match nothing).
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ShredPack-build
           path: |
-            dist\ShredPack.exe
-            Output\ShredPack-Setup.exe
+            dist/ShredPack.exe
+            Output/ShredPack-Setup.exe
             SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -104,7 +115,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist\ShredPack.exe
-            Output\ShredPack-Setup.exe
+            dist/ShredPack.exe
+            Output/ShredPack-Setup.exe
             SHA256SUMS.txt
+          fail_on_unmatched_files: true
           generate_release_notes: true
