@@ -50,8 +50,17 @@ Download **`ShredPack-Setup.exe`** from the
 It installs per user (no administrator rights needed), adds the right-click menu
 (optional) and an entry in *Settings > Apps* for uninstalling. A portable
 `ShredPack.exe` is published too; run it once and use the *Add to menu* button.
-Each release includes `SHA256SUMS.txt` so you can verify your download (the app's
-own *Checksum...* button works for that).
+Each release includes `SHA256SUMS.txt` (one line per file: the SHA-256 hash, two
+spaces, the file name) so you can verify your download. The release workflow
+generates it from the exact files it publishes, checks it against them, and fails
+the build if it - or either `.exe` - is missing from the release.
+
+To verify, hash the file you downloaded and compare it with its line in
+`SHA256SUMS.txt` (the app's own *Checksum...* button does the same):
+
+```
+Get-FileHash .\ShredPack-Setup.exe -Algorithm SHA256
+```
 
 On Windows 11 the entries appear under **Show more options** in the right-click menu.
 
@@ -98,15 +107,34 @@ pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico
 ```
 
 The installer is built from `setup.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php).
-The GitHub workflow does all of this; push a tag like `v1.1.0` (it must match
-`APP_VERSION` in `shredpack.py`) to publish a release, or use *Actions > Run workflow*
-for a test build.
+`setup.iss` has no default version on purpose; pass the one in `shredpack.py`:
+`ISCC.exe /DMyAppVersion=x.y.z setup.iss` (x.y.z = `APP_VERSION`).
+
+### Releases
+
+`.github/workflows/build.yml` is the only workflow. It runs the tests, builds
+`dist/ShredPack.exe` and `Output/ShredPack-Setup.exe`, writes and verifies
+`SHA256SUMS.txt`, and attaches all three files to a release - always a version
+release (`vX.Y.Z`), never a moving `latest` tag:
+
+- **Push a tag** such as `v1.1.1`: the tag must equal `v` + `APP_VERSION` in
+  `shredpack.py`, otherwise the run fails. The files are attached to that tag's release.
+- **Actions > Build ShredPack > Run workflow** (on `main`): attaches a fresh build to the
+  *existing* release named in `release_tag` (same version rule). It never creates a
+  release or tag. Leave `release_tag` empty for a build that publishes nothing.
+- Pushes to `main` and pull requests only run the tests and build.
+
+Only the newest version is marked "Latest"; re-attaching files to an older release
+leaves that flag alone. Update `VERSION.txt` (it drives the in-app update link) when
+you announce a release.
 
 ## Tests
 
 ```
-python tests/test_shredpack.py   # engine: every format, selection, links, integrity, ...
-python tests/ui_smoke.py         # drives the UI logic with stand-in widgets
+python tests/test_shredpack.py       # engine: every format, selection, links, integrity, ...
+python tests/ui_smoke.py             # drives the UI logic with stand-in widgets
+python tests/test_menu_and_zip.py    # right-click menu registration (fake registry) + ZIP verification
+python tests/test_ui_event_loop.py   # the real app inside a stand-in Tk event loop (incl. right-click launches)
 ```
 
 The tests use only the standard library, so the optional 7Z/ISO/AES code paths are
