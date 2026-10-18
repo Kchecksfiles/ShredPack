@@ -52,8 +52,11 @@ It installs per user (no administrator rights needed), adds the right-click menu
 `ShredPack.exe` is published too; run it once and use the *Add to menu* button.
 Each release includes `SHA256SUMS.txt` (one line per file: the SHA-256 hash, two
 spaces, the file name) so you can verify your download. The release workflow
-generates it from the exact files it publishes, checks it against them, and fails
-the build if it - or either `.exe` - is missing from the release.
+generates it from the exact files it publishes, checks it against them, then
+downloads the published assets back from the release and checks them again - the
+build fails if any of the three files is missing, differs from what was built,
+or doesn't verify. (Releases published before this workflow existed have no
+`SHA256SUMS.txt`; the app's *Checksum...* button can hash those files.)
 
 To verify, hash the file you downloaded and compare it with its line in
 `SHA256SUMS.txt` (the app's own *Checksum...* button does the same):
@@ -117,11 +120,16 @@ The installer is built from `setup.iss` with [Inno Setup](https://jrsoftware.org
 `SHA256SUMS.txt`, and attaches all three files to a release - always a version
 release (`vX.Y.Z`), never a moving `latest` tag:
 
-- **Push a tag** such as `v1.1.1`: the tag must equal `v` + `APP_VERSION` in
-  `shredpack.py`, otherwise the run fails. The files are attached to that tag's release.
-- **Actions > Build ShredPack > Run workflow** (on `main`): attaches a fresh build to the
-  *existing* release named in `release_tag` (same version rule). It never creates a
-  release or tag. Leave `release_tag` empty for a build that publishes nothing.
+- **Push a tag** such as `v1.1.2`: the tag must equal `v` + `APP_VERSION` in
+  `shredpack.py`, otherwise the run fails. The files are attached to that tag's release
+  (created if the tag has none). A tag build never replaces files already on a release.
+- **Actions > Build ShredPack > Run workflow** (on `main`): with `publish` **unticked**
+  (the default) it is a safe test build - nothing is published and no release is touched.
+  Tick `publish` and enter `release_tag` to attach a fresh build to that *existing,
+  published* release (same version rule). It never creates a release or tag; it refuses to
+  replace files already attached unless you tick `replace_existing_assets`, and refuses to
+  attach a build of `main` to a release whose tag points at a different commit unless you
+  tick `allow_commit_mismatch`.
 - Pushes to `main` and pull requests only run the tests and build.
 
 Only the newest version is marked "Latest"; re-attaching files to an older release
