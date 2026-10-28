@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/34076164/README.md)
 <div align="center">
 
 <img src="assets/shredpack-icon.png" alt="ShredPack icon" width="112" height="112">
@@ -79,7 +78,7 @@ Limits: archives that encrypt their **file names** can't be opened, and **Extrac
 
 **Installer (recommended).** Download `ShredPack-Setup.exe` from [Releases](https://github.com/Kchecksfiles/ShredPack/releases) and run it. It installs for your user (no administrator rights needed unless you choose an all-users install), can add the right-click menu, and adds an entry to *Settings > Apps* for uninstalling. Uninstalling removes the right-click entries ShredPack created.
 
-**Portable.** Download `ShredPack.exe` and run it anywhere. On first launch it offers to add the right-click menu; if you say no, it won't ask again. The portable file unpacks itself on each start, so the installed app opens a little faster.
+**Portable.** Download `ShredPack.exe` and run it anywhere. On first launch it offers to add the right-click menu; if you say no, it won't ask again. A single-file portable build has to unpack its bundled libraries into a temporary folder every time it starts (the installed app does not), so it opens a little slower, and so does every right-click action if the menu points at the portable file. For daily use, prefer the installer. ShredPack itself starts the extraction immediately and does the work on a background thread, so the unpacking is the only avoidable-by-installing cost.
 
 Each release also lists `SHA256SUMS.txt`. To verify a download:
 
@@ -105,14 +104,14 @@ Right-click an **archive** in Explorer:
 |---|---|
 | **Extract files...** | Opens the options screen so you choose the destination |
 | **Extract Here** | Starts at once, into a new folder named after the archive, next to it |
-| **Extract to `<archive name>\`** | Extracts into a folder named after the archive |
+| **Extract to `<archive name>\`** | Starts at once (no options screen, no confirmation) into a new folder named after the archive, next to it |
 | **Open with ShredPack >** | A submenu: **Extract & Free Space...**, **Test archive**, **Add to ZIP**, **Add to archive...** |
 
 Right-click any **other file or folder**: **Open with ShredPack >** **Add to ZIP** / **Add to archive...**.
 
 Things to know:
 
-- The third entry reads literally `Extract to <archive name>\`. A registry-based Windows menu can't show each archive's real name; that would need a compiled shell extension, which ShredPack doesn't install. Today it does the same thing as *Extract Here* (a new folder named after the archive). Inside the app, the options screen shows the real name (for example `Extract to Backup\` for `Backup.tar.gz`).
+- The third entry reads literally `Extract to <archive name>\`. A registry-based Windows menu can't show each archive's real name; that would need a compiled shell extension, which ShredPack doesn't install. Today it does the same thing as *Extract Here* (a new folder named after the archive, started at once). Inside the app, the progress window names the real destination (for example `Extracting to Backup\` for `Backup.tar.gz`), including a ` (2)` suffix if that folder already exists. The only warning you can still see before extraction starts is the safety check for a suspiciously large archive or not enough free disk space.
 - On Windows 11 the entries are under **Show more options**.
 - The menu works on **one selected item at a time**. To combine several items into one archive, use **Create** or drag them onto the window.
 - The entries are registered for your user account only (nothing needs administrator rights). The installer registers them and removes them on uninstall. They are stored in the registry, so they stay across restarts.

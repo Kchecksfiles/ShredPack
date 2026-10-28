@@ -2314,27 +2314,45 @@ def _sound(kind):
         return _sound_cache[kind]
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+
 def prime_sounds():
     """Build the sounds on a background thread so the chime is instant when a job ends."""
-    if sys.platform == "win32":
+    if IS_WINDOWS:
         threading.Thread(target=lambda: (_sound("done"), _sound("error")), daemon=True).start()
 
 
+SOUND_TAIL_MS = 350     # extra time before the process may exit: audio devices need a moment to wake
+
+
 def play_sound(kind):
-    """Play 'done' or 'error' without blocking. Returns its length in ms (0 = nothing played).
+    """Play 'done' or 'error' without blocking. Returns how long the process should stay alive
+    for it to be heard, in ms (0 = nothing played).
 
     winsound can't play from memory asynchronously (SND_MEMORY | SND_ASYNC raises
     RuntimeError), so the in-memory WAV plays on a short-lived daemon thread instead.
     """
-    if sys.platform != "win32":
+    if not IS_WINDOWS:
         return 0
     try:
         import winsound
         data, ms = _sound(kind)
-        threading.Thread(target=winsound.PlaySound, args=(data, winsound.SND_MEMORY),
-                         daemon=True).start()
-        return ms
+
+        def run():
+            try:
+                winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+            except Exception:  # noqa: BLE001
+                log_exception("Completion sound failed")
+                try:
+                    winsound.MessageBeep(winsound.MB_OK)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return ms + SOUND_TAIL_MS
     except Exception:  # noqa: BLE001 - a sound must never break an extraction
+        log_exception("Couldn't start the completion sound")
         return 0
 
 
@@ -2545,6 +2563,8 @@ def declared_file_sizes(path, password=None):
     when the format can't tell (any size unknown, or the listing can't be read). None means
     'no extra check', never 'passed'."""
     try:
+        if detect_format(path) not in ("zip", "7z"):
+            return None      # listing a TAR / single-file stream means decompressing it all again
         entries = list_archive(path, password)["entries"]
     except (ArchiveError, NeedPassword, Unsupported, OSError):
         return None
@@ -3327,6 +3347,12 @@ def install_state():
 # --------------------------------------------------------------------------
 # The application window
 # --------------------------------------------------------------------------
+def is_instant_mode(mode, settings):
+    """Right-click extractions that run straight through with no options screen:
+    'Extract to <name>\\' always; 'Extract Here' unless the user turned that off."""
+    return mode == "folder" or (mode == "here" and bool(settings.get("quick_here", True)))
+
+
 class ShredPackApp(object):
     def __init__(self, root, archives=None, mode="dialog", from_shell=False, compact=False):
         self.root = root
@@ -3339,7 +3365,7 @@ class ShredPackApp(object):
         # Right-click actions that run straight through get a small, flat progress window that
         # stays hidden unless the job lasts more than a blink.
         self.compact = bool(from_shell and (compact or (
-            archives and mode == "here" and self.settings.get("quick_here", True))))
+            archives and is_instant_mode(mode, self.settings))))
         self._hidden = False
         self._settings_prev = "home"
         self.k = max(1.0, root.winfo_fpixels("1i") / 96.0)
@@ -3352,6 +3378,7 @@ class ShredPackApp(object):
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.pw_event = threading.Event()
+        self.ask_event, self.ask_value = threading.Event(), False
         self.pw_value = None
         self.cur_idx, self.cur_n = 1, 1
 
@@ -3455,6 +3482,8 @@ class ShredPackApp(object):
             self._filter_job = None
         self.cancel.set()
         self.pw_event.set()      # release a worker waiting for a password answer
+        self.ask_value = False
+        self.ask_event.set()
         self.root.destroy()
 
     def _present(self):
@@ -4277,18 +4306,18 @@ class ShredPackApp(object):
         self.include_var.set("")
         self.exclude_var.set("")
         self.state = "choice"
+        if is_instant_mode(mode, self.settings):
+            # Extract Here / Extract to <name>\\: start at once - no options screen, no popup.
+            self.begin()
+            if self.state != "processing":
+                self._quick_aborted()
+            return
         self.refresh_choice()
         if mode == "free":
             # Right-click > Open with ShredPack > Extract & Free Space: always confirm first.
             self.show(self.view_choice)
             if self._confirm_free_space(self.archives):
                 self.begin(free_space=True)
-            if self.state != "processing":
-                self._quick_aborted()
-            return
-        if mode == "here" and self.settings.get("quick_here", True):
-            # Extract Here does what it says: no confirmation screen, the saved settings apply.
-            self.begin()
             if self.state != "processing":
                 self._quick_aborted()
             return
@@ -4948,8 +4977,7 @@ class ShredPackApp(object):
                     "would be lost.",
                     parent=self.root, icon="warning", default="no"):
                 delete = False
-        if not filtered and not self._preflight_ok(dest_dir, subfolder):
-            return
+        opts["preflight"] = not filtered     # size / free-space check runs in the worker
 
         self.state = "processing"
         self.action = "extract"
@@ -4968,29 +4996,12 @@ class ShredPackApp(object):
         ).start()
         self._ensure_poll()
 
-    def _preflight_ok(self, dest_dir, subfolder):
-        """Warn (and let the user bail out) before extracting anything that
-        looks like a decompression bomb or won't fit the destination drive.
-        Skipped for split/multi-part archives, which can't be sized cheaply."""
-        for arc in self.archives:
-            if detect_split_parts(arc):
-                continue
-            try:
-                fmt = detect_format(arc)
-            except ArchiveError:
-                continue
-            dest = compute_dest(arc, self.mode, dest_dir, subfolder)
-            risk = preflight_risk(arc, dest, fmt)
-            if risk:
-                self._reveal()
-                proceed = messagebox.askyesno(
-                    APP_NAME,
-                    "%s\n\n%s\n\nContinue anyway?" % (shorten(os.path.basename(arc), 50), risk),
-                    parent=self.root, icon="warning",
-                )
-                if not proceed:
-                    return False
-        return True
+    def _ask_user(self, kind, *payload):
+        """Called from the worker thread: have the UI thread ask a yes/no question and wait."""
+        self.ask_event.clear()
+        self.q.put((kind,) + payload)
+        self.ask_event.wait()
+        return self.ask_value
 
     def on_cancel(self):
         if self.state == "processing":
@@ -5040,6 +5051,7 @@ class ShredPackApp(object):
             join_dir = None
             try:
                 dest = compute_dest(arc, mode, dest_dir, subfolder)
+                self.q.put(("dest", idx, total, dest))
 
                 parts = detect_split_parts(arc)
                 originals = parts if parts else [arc]
@@ -5050,6 +5062,16 @@ class ShredPackApp(object):
                     source = join_split_parts(
                         parts, join_dir,
                         Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t))))
+
+                if opts.get("preflight") and not parts:
+                    risk = None
+                    try:
+                        risk = preflight_risk(arc, dest, detect_format(arc))
+                    except ArchiveError:
+                        pass
+                    if risk and not self._ask_user("confirm_risk", name, risk):
+                        self.cancel.set()              # declined: leave everything untouched
+                        raise Cancelled()
 
                 password = opts.get("password")
                 while True:
@@ -5069,6 +5091,7 @@ class ShredPackApp(object):
                             raise Cancelled()
 
                 res["status"] = "ok"
+                res["dest"] = outcome["dest"]
                 if opts.get("free_space"):
                     # Extract & Free Space: delete only if every safety check passes.
                     if self.cancel.is_set():
@@ -5138,6 +5161,11 @@ class ShredPackApp(object):
                     "list": "Reading "}.get(self.action, "Extracting ")
             self.lbl_p_title.config(text=verb + shorten(name, 44))
             self._set_progress(0, 0, 0)
+        elif kind == "dest":
+            _, _idx, count, dest = msg
+            if count == 1 and self.action == "extract" and self.mode in ("here", "folder", "free"):
+                # the real folder the files are going to (it may carry a " (2)" suffix)
+                self.lbl_p_title.config(text="Extracting to " + shorten(os.path.basename(dest), 40) + "\\")
         elif kind == "progress":
             self._set_progress(msg[1], msg[2], msg[3])
         elif kind == "password":
@@ -5148,6 +5176,13 @@ class ShredPackApp(object):
             pw = simpledialog.askstring(APP_NAME, prompt, show="*", parent=self.root)
             self.pw_value = pw if pw else None
             self.pw_event.set()
+        elif kind == "confirm_risk":
+            _, name, risk = msg
+            self._reveal()
+            self.ask_value = bool(messagebox.askyesno(
+                APP_NAME, "%s\n\n%s\n\nContinue anyway?" % (shorten(name, 50), risk),
+                parent=self.root, icon="warning", default="no"))
+            self.ask_event.set()
         elif kind == "finished":
             self._finish(msg[1])
         elif kind == "compress_finished":
@@ -5233,7 +5268,10 @@ class ShredPackApp(object):
                                    parent=self.root)
         for r in oks:
             notes.extend(r.get("notes", []))
-        self._finish_ok("Extraction complete", notes, notes)
+        lines = list(notes)
+        if not self.compact and len(oks) == 1 and oks[0].get("dest"):
+            lines.insert(0, "Extracted to " + shorten(oks[0]["dest"], 56))
+        self._finish_ok("Extraction complete", lines, notes)
 
     def _back_to_choice(self, results):
         finished = {r["path"] for r in results if r["status"] == "ok"}
