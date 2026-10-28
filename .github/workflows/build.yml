@@ -161,7 +161,7 @@ jobs:
         shell: pwsh
         run: |
           $rar = if ($env:SHREDPACK_RAR -eq "1") { @("--hidden-import", "unrar.cffi.unrarlib", "--hidden-import", "unrar.cffi._unrarlib", "--hidden-import", "_cffi_backend") } else { @() }
-          pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --name ShredPack shredpack.py
+          pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --exclude-module sqlite3 --exclude-module pydoc_data --exclude-module lib2to3 --exclude-module turtle --exclude-module idlelib --name ShredPack shredpack.py
           if ($LASTEXITCODE -ne 0) { throw "PyInstaller (portable build) failed with exit code $LASTEXITCODE" }
 
       # The installed app is a folder build: it doesn't unpack itself into %TEMP% on every start,
@@ -170,7 +170,7 @@ jobs:
         shell: pwsh
         run: |
           $rar = if ($env:SHREDPACK_RAR -eq "1") { @("--hidden-import", "unrar.cffi.unrarlib", "--hidden-import", "unrar.cffi._unrarlib", "--hidden-import", "_cffi_backend") } else { @() }
-          pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --name ShredPack shredpack.py
+          pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --exclude-module sqlite3 --exclude-module pydoc_data --exclude-module lib2to3 --exclude-module turtle --exclude-module idlelib --name ShredPack shredpack.py
           if ($LASTEXITCODE -ne 0) { throw "PyInstaller (folder build) failed with exit code $LASTEXITCODE" }
 
       - name: Ensure Inno Setup 6 is available
