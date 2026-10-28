@@ -78,6 +78,13 @@ jobs:
           ls -l tests || true
           exit "$missing"
 
+      # Optional libraries: with them installed the tests also cover 7Z and RAR extraction;
+      # without them those tests are reported as SKIP. A failed install is not fatal here.
+      - name: Install optional libraries for the tests
+        run: |
+          pip install py7zr || echo "::warning::py7zr not installed: 7Z tests will be skipped"
+          pip install unrar-cffi || echo "::warning::unrar-cffi not installed: RAR tests will be skipped"
+
       - name: Engine tests
         run: python tests/test_shredpack.py
 
@@ -127,13 +134,44 @@ jobs:
       - name: Install dependencies
         run: pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash pyinstaller
 
+      # RAR extraction uses unrar-cffi (a binding to RARLAB's UnRAR source, which may be
+      # redistributed for extraction). PyPI has no prebuilt Windows wheel for Python 3.11, so pip
+      # compiles it with the runner's Visual C++ tools. If that ever fails, the build continues
+      # WITHOUT RAR (the app then says "RAR support isn't included in this build") and this
+      # step prints a warning - check the log if RAR matters for a release.
+      - name: Install RAR support (unrar-cffi)
+        shell: pwsh
+        run: |
+          pip install unrar-cffi
+          $installed = ($LASTEXITCODE -eq 0)
+          if ($installed) {
+            python -c "from unrar.cffi import unrarlib; from unrar.cffi._unrarlib import lib; print('UnRAR library version', lib.RARGetDllVersion())"
+            $installed = ($LASTEXITCODE -eq 0)
+          }
+          $global:LASTEXITCODE = 0
+          if ($installed) {
+            "SHREDPACK_RAR=1" >> $env:GITHUB_ENV
+            Write-Host "RAR support: INCLUDED"
+          } else {
+            "SHREDPACK_RAR=0" >> $env:GITHUB_ENV
+            Write-Host "::warning::unrar-cffi could not be built; this build will NOT open RAR files."
+          }
+
       - name: Build ShredPack.exe
-        run: pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
+        shell: pwsh
+        run: |
+          $rar = if ($env:SHREDPACK_RAR -eq "1") { @("--hidden-import", "unrar.cffi.unrarlib", "--hidden-import", "unrar.cffi._unrarlib", "--hidden-import", "_cffi_backend") } else { @() }
+          pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --name ShredPack shredpack.py
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller (portable build) failed with exit code $LASTEXITCODE" }
 
       # The installed app is a folder build: it doesn't unpack itself into %TEMP% on every start,
       # so right-click actions open faster. The portable single-file exe above is unchanged.
       - name: Build the installed app (folder build)
-        run: pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
+        shell: pwsh
+        run: |
+          $rar = if ($env:SHREDPACK_RAR -eq "1") { @("--hidden-import", "unrar.cffi.unrarlib", "--hidden-import", "unrar.cffi._unrarlib", "--hidden-import", "_cffi_backend") } else { @() }
+          pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --name ShredPack shredpack.py
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller (folder build) failed with exit code $LASTEXITCODE" }
 
       - name: Ensure Inno Setup 6 is available
         shell: pwsh
