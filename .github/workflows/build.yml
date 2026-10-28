@@ -1,21 +1,126 @@
+# Commit as:  .github/workflows/build.yml
+# (GitHub only runs workflows stored in .github/workflows/ - a build.yml in the
+#  repository root is never executed.)
+#
+# WHAT RUNS WHEN
+#   pull_request, push to main ..... test + build only. Never publishes.
+#   manual run, "publish" unticked .. test + build only (the default). Never publishes,
+#                                     never creates or changes a tag or release.
+#   push of a tag vX.Y.Z ............ test + build, then publish to release vX.Y.Z.
+#   manual run, "publish" ticked .... test + build, then publish - only from main.
+#
+# PUBLISH RULES (tag must equal v<APP_VERSION>; VERSION.txt must equal APP_VERSION)
+#   Tag exists and points at this commit:
+#     no release yet ............ a new release is created for the tag
+#     release exists, 0 assets .. the 3 files are attached; its name/notes/flags are left alone
+#     release exists, has assets  FAIL (manual run may tick "overwrite" to replace them)
+#   Tag exists but points at a different commit: FAIL, always.
+#   Tag does not exist (manual run only): FAIL, unless "create_tag" is ticked. If ticked,
+#     the release action creates the tag at this commit and a new release.
+#   A tag push always has an existing tag; "overwrite" and "create_tag" are not available there.
+#   A DRAFT release (or more than one release) for the tag: FAIL - the release action would auto-publish a draft.
+#   This workflow never touches the rolling "latest" pre-release or any other tag.
 name: Build ShredPack
 
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the release for v<APP_VERSION> (OFF = test build only: nothing is published or modified)"
+        type: boolean
+        default: false
+      create_tag:
+        description: "Only with publish: allow creating tag v<APP_VERSION> at this commit and a NEW release if the tag does not exist"
+        type: boolean
+        default: false
+      overwrite:
+        description: "Only with publish: allow replacing assets if the release already has assets"
+        type: boolean
+        default: false
 
+# Least privilege by default; only the release job gets write access.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: windows-latest
-
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      - name: Refuse a manual publish from anything except main (fail early)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Manual publishing is only allowed from main (this run is on ${GITHUB_REF})."
+          exit 1
+
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check the test files exist
+        run: |
+          missing=0
+          for f in tests/test_shredpack.py tests/ui_smoke.py tests/test_ui_event_loop.py; do
+            if [[ ! -f "$f" ]]; then echo "::error::Missing test file: $f"; missing=1; fi
+          done
+          ls -l tests || true
+          exit "$missing"
+
+      - name: Engine tests
+        run: python tests/test_shredpack.py
+
+      - name: UI logic smoke tests
+        run: python tests/ui_smoke.py
+
+      - name: UI event-loop tests
+        run: python tests/test_ui_event_loop.py
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v7
+
+      - name: Read version and cross-check VERSION.txt and tag
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $match = Select-String -Path shredpack.py -Pattern '^APP_VERSION = "([^"]+)"'
+          if (-not $match) { throw "Could not find APP_VERSION in shredpack.py" }
+          $v = $match.Matches[0].Groups[1].Value
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "APP_VERSION '$v' is not X.Y.Z" }
+
+          $fileVersion = (Get-Content VERSION.txt -Raw).Trim()
+          if ($fileVersion -ne $v) {
+            throw "VERSION.txt ($fileVersion) does not match APP_VERSION in shredpack.py ($v)"
+          }
+
+          if ($env:GITHUB_REF -like "refs/tags/*" -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION v$v"
+          }
+
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "ShredPack version: $v"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -25,45 +130,279 @@ jobs:
       - name: Build ShredPack.exe
         run: pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y
+      # The installed app is a folder build: it doesn't unpack itself into %TEMP% on every start,
+      # so right-click actions open faster. The portable single-file exe above is unchanged.
+      - name: Build the installed app (folder build)
+        run: pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
 
-      - name: Build installer
-        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss'
-
-      - name: Verify build files
+      - name: Ensure Inno Setup 6 is available
+        shell: pwsh
         run: |
-          Write-Host "Checking dist folder:"
-          Get-ChildItem -Recurse dist
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed ($LASTEXITCODE)" }
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          Write-Host "Using $iscc (version $((Get-Item $iscc).VersionInfo.ProductVersion))"
 
-          Write-Host "Checking Output folder:"
-          Get-ChildItem -Recurse Output
+      # setup.iss uses "#ifndef MyAppVersion", so /DMyAppVersion=... overrides its fallback.
+      - name: Build installer
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "dist-app/ShredPack/ShredPack.exe")) { throw "Folder build missing: dist-app/ShredPack/ShredPack.exe" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:APP_VERSION" setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
-          if (!(Test-Path "dist\ShredPack.exe")) {
-            Write-Error "ShredPack.exe was not created!"
-            exit 1
+      # Everything that gets released is copied ONCE into release/, hashed there,
+      # uploaded from there, and later published from the downloaded copy of there.
+      - name: Stage release files and generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($f in "dist/ShredPack.exe", "Output/ShredPack-Setup.exe") {
+            if (-not (Test-Path -LiteralPath $f)) { throw "Missing build output: $f" }
+            if ((Get-Item -LiteralPath $f).Length -le 0) { throw "Empty build output: $f" }
+          }
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item -LiteralPath dist/ShredPack.exe release/ShredPack.exe
+          Copy-Item -LiteralPath Output/ShredPack-Setup.exe release/ShredPack-Setup.exe
+
+          $names = "ShredPack.exe", "ShredPack-Setup.exe"
+          $lines = foreach ($n in $names) {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path "release" $n)).Hash.ToLowerInvariant()
+            "$h  $n"     # two spaces: the format `sha256sum -c` expects
+          }
+          # LF endings, no BOM, so the file also verifies with sha256sum on Linux/macOS
+          $out = Join-Path $PWD "release/SHA256SUMS.txt"
+          [System.IO.File]::WriteAllText($out, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content $out
+
+      - name: Verify checksums (recalculate and compare)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = "ShredPack.exe", "ShredPack-Setup.exe"
+
+          # Exactly three files, nothing else, in release/
+          $present = @(Get-ChildItem -LiteralPath release -File | ForEach-Object { $_.Name })
+          $wanted  = @("SHA256SUMS.txt", "ShredPack-Setup.exe", "ShredPack.exe")
+          if ($present.Count -ne $wanted.Count) {
+            throw "release/ contains [$($present -join ', ')], expected [$($wanted -join ', ')]"
+          }
+          foreach ($w in $wanted) {
+            if ($present -cnotcontains $w) { throw "release/ is missing $w (found [$($present -join ', ')])" }
           }
 
-          if (!(Test-Path "Output\ShredPack-Setup.exe")) {
-            Write-Error "ShredPack-Setup.exe was not created!"
-            exit 1
+          # Encoding: no BOM, no CR, ends with LF
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path $PWD "release/SHA256SUMS.txt"))
+          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "SHA256SUMS.txt has a BOM" }
+          if ($bytes -contains 13) { throw "SHA256SUMS.txt contains CR characters" }
+          if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne 10) { throw "SHA256SUMS.txt does not end with LF" }
+
+          $entries = @(Get-Content release/SHA256SUMS.txt | Where-Object { $_.Trim() })
+          if ($entries.Count -ne $expected.Count) {
+            throw "SHA256SUMS.txt has $($entries.Count) entries, expected $($expected.Count)"
+          }
+          $seen = @{}
+          foreach ($line in $entries) {
+            if ($line -match '^([0-9a-f]{64})  (\S.*)$') {
+              $want = $Matches[1]
+              $name = $Matches[2]
+            } else {
+              throw "Malformed checksum line: $line"
+            }
+            if ($expected -cnotcontains $name) { throw "Unexpected entry in SHA256SUMS.txt: $name" }
+            if ($seen.ContainsKey($name)) { throw "Duplicate entry in SHA256SUMS.txt: $name" }
+            $seen[$name] = $true
+            $path = Join-Path "release" $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "Listed file missing: $name" }
+            if ((Get-Item -LiteralPath $path).Length -le 0) { throw "Listed file is empty: $name" }
+            $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($got -ne $want) { throw "HASH MISMATCH for ${name}: listed $want, actual $got" }
+            Write-Host "OK  $name  $got"
+          }
+          foreach ($e in $expected) {
+            if (-not $seen.ContainsKey($e)) { throw "$e is not listed in SHA256SUMS.txt" }
+          }
+
+          # The staged copies must be byte-identical to what the build produced.
+          $pairs = @(@("dist/ShredPack.exe", "release/ShredPack.exe"),
+                     @("Output/ShredPack-Setup.exe", "release/ShredPack-Setup.exe"))
+          foreach ($p in $pairs) {
+            $a = (Get-FileHash -Algorithm SHA256 -LiteralPath $p[0]).Hash
+            $b = (Get-FileHash -Algorithm SHA256 -LiteralPath $p[1]).Hash
+            if ($a -ne $b) { throw "Staged copy differs from build output: $($p[0])" }
           }
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ShredPack-build
+          name: ShredPack-release
           path: |
-            dist\ShredPack.exe
-            Output\ShredPack-Setup.exe
+            release/ShredPack.exe
+            release/ShredPack-Setup.exe
+            release/SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+  release:
+    needs: build
+    # Tag push -> publish. Manual run -> publish only if "publish" was ticked.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    # Only one publish at a time, whichever ref started it.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.build.outputs.version }}
+      OVERWRITE: ${{ github.event_name == 'workflow_dispatch' && inputs.overwrite || false }}
+      CREATE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.create_tag || false }}
+    steps:
+      - name: Check out repo (full history and tags, for the tag checks)
+        uses: actions/checkout@v7
         with:
-          tag_name: latest
-          name: ShredPack Latest
-          make_latest: true
+          fetch-depth: 0
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ShredPack-release
+          path: release
+
+      - name: Re-verify the downloaded files with sha256sum
+        run: |
+          set -euo pipefail
+          cd release
+          ls -l
+          [[ "$(ls -1 | LC_ALL=C sort | tr '\n' ' ')" == "SHA256SUMS.txt ShredPack-Setup.exe ShredPack.exe " ]] \
+            || { echo "::error::Artifact must contain exactly SHA256SUMS.txt, ShredPack-Setup.exe and ShredPack.exe"; exit 1; }
+          for f in SHA256SUMS.txt ShredPack-Setup.exe ShredPack.exe; do
+            [[ -s "$f" ]] || { echo "::error::$f is empty"; exit 1; }
+          done
+          # Format: no CR, no BOM, ends with LF, exactly one line per binary, nothing else
+          if LC_ALL=C grep -q $'\r' SHA256SUMS.txt; then echo "::error::SHA256SUMS.txt contains CR characters"; exit 1; fi
+          [[ "$(head -c3 SHA256SUMS.txt | od -An -tx1 | tr -d ' \n')" != "efbbbf" ]] || { echo "::error::SHA256SUMS.txt has a BOM"; exit 1; }
+          [[ -z "$(tail -c1 SHA256SUMS.txt)" ]] || { echo "::error::SHA256SUMS.txt does not end with LF"; exit 1; }
+          if grep -Evq '^[0-9a-f]{64}  (ShredPack\.exe|ShredPack-Setup\.exe)$' SHA256SUMS.txt; then
+            echo "::error::SHA256SUMS.txt has a malformed or unexpected line"; exit 1
+          fi
+          [[ "$(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS.txt | LC_ALL=C sort | tr '\n' ' ')" == "ShredPack-Setup.exe ShredPack.exe " ]] \
+            || { echo "::error::SHA256SUMS.txt must list ShredPack.exe and ShredPack-Setup.exe exactly once each"; exit 1; }
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Decide release tag and guard against surprises
+        id: guard
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          TAG_EXISTS=false
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then TAG_EXISTS=true; fi
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            [[ "$GITHUB_REF_NAME" == "$TAG" ]] || { echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION ($TAG)"; exit 1; }
+            [[ "$TAG_EXISTS" == "true" ]] || { echo "::error::Tag $TAG is not present in the checkout"; exit 1; }
+          else
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "::error::Manual publish is only allowed from main"; exit 1; }
+          fi
+
+          if [[ "$TAG_EXISTS" == "true" ]]; then
+            TAG_SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+            if [[ "$TAG_SHA" != "$GITHUB_SHA" ]]; then
+              echo "::error::Tag $TAG points at $TAG_SHA, but this run built $GITHUB_SHA. Publishing would attach binaries from a different commit than the tag."
+              exit 1
+            fi
+          elif [[ "$CREATE_TAG" != "true" ]]; then
+            echo "::error::Tag $TAG does not exist, so nothing was published. Tick 'create_tag' to let this run create $TAG at $GITHUB_SHA and a new release, or push the tag yourself."
+            exit 1
+          fi
+
+          # The releases LIST includes drafts; "gh release view <tag>" may not.
+          RELEASES="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq ".[] | select(.tag_name == \"${TAG}\") | \"\(.draft) \(.assets | length)\"")"
+          NREL="$(printf '%s\n' "$RELEASES" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+          EXISTS=false
+          if [[ "$NREL" -gt 1 ]]; then
+            echo "::error::Found $NREL releases for $TAG; refusing to guess which one to update."
+            exit 1
+          fi
+          if [[ "$NREL" -eq 1 ]]; then
+            EXISTS=true
+            read -r IS_DRAFT ASSET_COUNT <<< "$RELEASES"
+            if ! [[ "$IS_DRAFT" =~ ^(true|false)$ && "$ASSET_COUNT" =~ ^[0-9]+$ ]]; then
+              echo "::error::Unexpected release data for $TAG ('$RELEASES'); refusing to continue."
+              exit 1
+            fi
+            if [[ "$IS_DRAFT" == "true" ]]; then
+              echo "::error::A DRAFT release already exists for $TAG. The release action would publish it automatically, so this workflow refuses. Publish or delete the draft yourself first."
+              exit 1
+            fi
+            if [[ "$ASSET_COUNT" -gt 0 && "$OVERWRITE" != "true" ]]; then
+              echo "::error::Release $TAG already has $ASSET_COUNT asset(s). Nothing was changed. Re-run manually with 'overwrite' ticked only if you really want to replace them."
+              exit 1
+            fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+          echo "Publishing to $TAG (tag exists: $TAG_EXISTS, release exists: $EXISTS)"
+
+      # NEW release (tag push, or manual run with create_tag): sets name, notes, latest flag.
+      - name: Create release and attach assets
+        if: steps.guard.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.guard.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ShredPack ${{ steps.guard.outputs.tag }}
+          make_latest: "true"
+          generate_release_notes: true
           files: |
-            dist\ShredPack.exe
-            Output\ShredPack-Setup.exe
+            release/ShredPack.exe
+            release/ShredPack-Setup.exe
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+
+      # EXISTING release: name/notes/latest/draft/prerelease inputs are not passed at all, so
+      # the release keeps its own metadata. Assets are only replaced if "overwrite" was ticked
+      # (the guard step has already failed the run otherwise).
+      - name: Attach assets to existing release
+        if: steps.guard.outputs.exists == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.guard.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            release/ShredPack.exe
+            release/ShredPack-Setup.exe
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          overwrite_files: ${{ env.OVERWRITE == 'true' }}
+
+      # Download what GitHub now actually serves and check it, so a missing or
+      # corrupted asset - or a tag on the wrong commit - fails the workflow.
+      - name: Verify the published release and its tag
+        env:
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet origin
+          TAG_SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          [[ "$TAG_SHA" == "$GITHUB_SHA" ]] || { echo "::error::Tag $TAG points at $TAG_SHA, not the built commit $GITHUB_SHA"; exit 1; }
+
+          rm -rf published && mkdir published && cd published
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "ShredPack.exe" --pattern "ShredPack-Setup.exe" --pattern "SHA256SUMS.txt"
+          for f in ShredPack.exe ShredPack-Setup.exe SHA256SUMS.txt; do
+            [[ -s "$f" ]] || { echo "::error::$f is missing or empty in release $TAG"; exit 1; }
+            cmp "$f" "../release/$f" || { echo "::error::Published $f differs from the build artifact"; exit 1; }
+          done
+          sha256sum -c SHA256SUMS.txt
