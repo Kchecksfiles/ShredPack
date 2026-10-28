@@ -8,7 +8,7 @@
 
 [Download](https://github.com/Kchecksfiles/ShredPack/releases) &nbsp;·&nbsp; [Report a problem](https://github.com/Kchecksfiles/ShredPack/issues) &nbsp;·&nbsp; [Right-click menu](#right-click-menu) &nbsp;·&nbsp; [Extract & Free Space](#extract--free-space)
 
-<img src="assets/shredpack-logo-animation.gif" alt="The ShredPack icon slides left and the ShredPack wordmark appears" width="560">
+<img src="assets/shredpack-logo-animation.gif" alt="A file feeds into a shredder; the strips fly together and rebuild the ShredPack icon" width="560">
 
 </div>
 
@@ -111,7 +111,7 @@ Right-click any **other file or folder**: **Open with ShredPack >** **Add to ZIP
 
 Things to know:
 
-- The third entry reads literally `Extract to <archive name>\`. A registry-based Windows menu can't show each archive's real name; that would need a compiled shell extension, which ShredPack doesn't install. Today it does the same thing as *Extract Here* (a new folder named after the archive).
+- The third entry reads literally `Extract to <archive name>\`. A registry-based Windows menu can't show each archive's real name; that would need a compiled shell extension, which ShredPack doesn't install. Today it does the same thing as *Extract Here* (a new folder named after the archive). Inside the app, the options screen shows the real name (for example `Extract to Backup\` for `Backup.tar.gz`).
 - On Windows 11 the entries are under **Show more options**.
 - The menu works on **one selected item at a time**. To combine several items into one archive, use **Create** or drag them onto the window.
 - The entries are registered for your user account only (nothing needs administrator rights). The installer registers them and removes them on uninstall. They are stored in the registry, so they stay across restarts.
@@ -130,6 +130,7 @@ Find it as the **Extract & Free Space** button on the options screen, or in the 
 3. Checks the result. The archive is deleted **only if every check passes**:
    - extraction finished without error and was not cancelled
    - the archive contained at least one file, and every file was written and is present
+   - where the format lists file sizes, the sizes on disk match the archive's own listing exactly
    - no file was skipped because one with that name already existed
    - the archive did not change (size and modified time) while it was being extracted
    - the extraction did not overwrite the archive itself, and the archive is a normal file, not a link

@@ -712,6 +712,12 @@ def archive_stem(path):
     return sanitize_name(base) or "Extracted"
 
 
+def extract_to_label(path):
+    """'Extract to <name>\\' for one archive: its file name without the archive extension
+    (compound ones such as .tar.gz included). Spaces and Unicode are kept."""
+    return "Extract to %s\\" % archive_stem(path)
+
+
 def unique_path(parent, name):
     """Folder-style unique name: 'Name', 'Name (2)', ..."""
     candidate = os.path.join(parent, name)
@@ -2465,7 +2471,7 @@ def file_signature(path):
         return None
 
 
-def free_space_blocker(originals, before, ctx, outcome, filtered):
+def free_space_blocker(originals, before, ctx, outcome, filtered, expected_sizes=None):
     """None if it is safe to delete `originals` after this extraction, otherwise a short
     reason (shown to the user) why they must be kept.
 
@@ -2473,7 +2479,9 @@ def free_space_blocker(originals, before, ctx, outcome, filtered):
     before    - their file_signature() values taken before extraction started
     ctx       - the finished extraction's Ctx
     outcome   - what extract_archive() returned
-    filtered  - True if only part of the archive was selected for extraction"""
+    filtered  - True if only part of the archive was selected for extraction
+    expected_sizes - None, or the file sizes the archive's own table of contents declares;
+                     when given, the sizes on disk must match them exactly"""
     if filtered:
         return "only part of the archive was extracted"
     if getattr(ctx, "multivolume", False):
@@ -2494,6 +2502,13 @@ def free_space_blocker(originals, before, ctx, outcome, filtered):
         if not os.path.isfile(lp(full)):
             return "an extracted file is missing from the destination"
         wrote.add(os.path.normcase(os.path.abspath(full)))
+    if expected_sizes is not None:
+        try:
+            on_disk = sorted(os.path.getsize(lp(os.path.join(dest, rel))) for rel in placed)
+        except OSError:
+            return "an extracted file couldn't be read back"
+        if on_disk != sorted(expected_sizes):
+            return "the size of an extracted file doesn't match the archive's listing"
     for orig, sig in zip(originals, before):
         if os.path.normcase(os.path.abspath(orig)) in wrote:
             return "the extraction replaced the archive itself"
@@ -2525,12 +2540,26 @@ def delete_permanently(path):
         return exc.strerror or "the file couldn't be removed"
 
 
-def free_space_after_extraction(originals, before, ctx, outcome, filtered):
+def declared_file_sizes(path, password=None):
+    """The sizes of the files an archive says it holds (from its table of contents), or None
+    when the format can't tell (any size unknown, or the listing can't be read). None means
+    'no extra check', never 'passed'."""
+    try:
+        entries = list_archive(path, password)["entries"]
+    except (ArchiveError, NeedPassword, Unsupported, OSError):
+        return None
+    sizes = [e["size"] for e in entries if not e["is_dir"]]
+    if any(not isinstance(n, int) for n in sizes):
+        return None
+    return sizes
+
+
+def free_space_after_extraction(originals, before, ctx, outcome, filtered, expected_sizes=None):
     """Apply the Extract & Free Space rules. Returns a dict with exactly one of:
     {'freed': bytes}      - the archive(s) were deleted
     {'kept': reason}      - checks didn't pass; nothing was deleted
     {'failed': reason}    - checks passed but deletion failed (extracted files are kept)"""
-    reason = free_space_blocker(originals, before, ctx, outcome, filtered)
+    reason = free_space_blocker(originals, before, ctx, outcome, filtered, expected_sizes)
     if reason:
         return {"kept": reason}
     freed = sum(sig[0] for sig in before if sig)
@@ -3301,6 +3330,8 @@ def install_state():
 class ShredPackApp(object):
     def __init__(self, root, archives=None, mode="dialog", from_shell=False, compact=False):
         self.root = root
+        self._alive = True        # False once the Tk window is destroyed
+        self._jobs = set()        # pending root.after ids, cancelled on destroy
         self.from_shell = from_shell
         self.archives = []
         self.mode = mode
@@ -3367,25 +3398,82 @@ class ShredPackApp(object):
         if self.compact:
             self._hidden = True
             root.withdraw()
+        else:
+            self._present()          # configure the window while it is certainly alive
 
+        # Start the requested action last: it may ask a question and, if declined, close the
+        # window (right-click launches). Nothing below touches Tk after that.
         if archives:
             self.open_archives(archives, mode)
         else:
             self.go_home()
 
-        if not self._hidden:
-            enable_dark_titlebar(root)
-            root.attributes("-topmost", True)
-            root.after(400, lambda: root.attributes("-topmost", False))
-            root.lift()
-            root.focus_force()
+        if not self._alive:
+            return
 
         if not from_shell:
             check_for_update(self._on_update_result)
 
+    # ---- window lifecycle ---------------------------------------------------
+    @property
+    def alive(self):
+        return self._alive
+
+    def _after(self, ms, fn):
+        """root.after that never fires on a destroyed window: jobs are tracked, cancelled
+        by _destroy(), and re-check the lifecycle flag when they run."""
+        if not self._alive:
+            return None
+        job = [None]
+
+        def run():
+            self._jobs.discard(job[0])
+            if self._alive:
+                fn()
+
+        job[0] = self.root.after(max(int(ms), 0), run)
+        self._jobs.add(job[0])
+        return job[0]
+
+    def _destroy(self):
+        """Close the window exactly once; later calls (a second timer, a late button click)
+        are no-ops instead of Tk commands on a dead interpreter."""
+        if not self._alive:
+            return
+        self._alive = False
+        for job in list(self._jobs):
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._jobs.clear()
+        if self._filter_job is not None:
+            try:
+                self.root.after_cancel(self._filter_job)
+            except tk.TclError:
+                pass
+            self._filter_job = None
+        self.cancel.set()
+        self.pw_event.set()      # release a worker waiting for a password answer
+        self.root.destroy()
+
+    def _present(self):
+        """Bring a visible window to the front (only while it is alive)."""
+        if not self._alive:
+            return
+        enable_dark_titlebar(self.root)
+        self.root.attributes("-topmost", True)
+        self._after(400, lambda: self.root.attributes("-topmost", False))
+        self.root.lift()
+        self.root.focus_force()
+
     def _on_update_result(self, latest):
-        if latest:
-            self.root.after(0, lambda: self.update_link.config(text="Update available: v" + latest))
+        if latest and self._alive:
+            try:
+                self.root.after(0, lambda: self._alive and self.update_link.config(
+                    text="Update available: v" + latest))
+            except (tk.TclError, RuntimeError):
+                pass         # the window closed while the version check was running
 
     def px(self, v):
         return int(round(v * self.k))
@@ -3546,7 +3634,6 @@ class ShredPackApp(object):
             rule.pack(fill="x", padx=px(20))
             line = tk.Frame(rule, bg=BORDER, height=1)
             line.place(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0)
-            tk.Frame(rule, bg=ACCENT, width=px(64), height=px(3)).place(x=0, y=0)
 
         body = tk.Frame(self.root, bg=BG)
         if self.compact:
@@ -3937,6 +4024,8 @@ class ShredPackApp(object):
             self._register_dnd(child)
 
     def show(self, view):
+        if not self._alive:
+            return
         for _name, v in self._views:
             v.pack_forget()
         view.pack(fill="both", expand=True)
@@ -4008,22 +4097,18 @@ class ShredPackApp(object):
 
     def _reveal(self):
         """Show the window if a compact run kept it hidden (long job, error, or a question)."""
-        if not self._hidden:
+        if not self._hidden or not self._alive:
             return
         self._hidden = False
         try:
             self.root.deiconify()
-            enable_dark_titlebar(self.root)
-            self.root.attributes("-topmost", True)
-            self.root.after(400, lambda: self.root.attributes("-topmost", False))
-            self.root.lift()
-            self.root.focus_force()
+            self._present()
         except tk.TclError:
             pass
 
     def _arm_reveal(self):
         if self._hidden:
-            self.root.after(450, self._reveal_if_busy)
+            self._after(450, self._reveal_if_busy)
 
     def _reveal_if_busy(self):
         if self.state == "processing":
@@ -4031,11 +4116,10 @@ class ShredPackApp(object):
 
     def _close_soon(self, ms=0):
         """Vanish at once; the process only lingers long enough for the chime to finish."""
-        try:
-            self.root.withdraw()
-        except tk.TclError:
-            pass
-        self.root.after(max(int(ms), 1), self.root.destroy)
+        if not self._alive:
+            return
+        self.root.withdraw()
+        self._after(max(int(ms), 1), self._destroy)
 
     def _finish_ok(self, title, lines, notes):
         """Shared success ending. Nothing to read -> the window closes immediately; otherwise
@@ -4057,14 +4141,14 @@ class ShredPackApp(object):
             self.show(self.view_done)
         delay = 900 if not notes else 3000
         if self.from_shell:
-            self.root.after(max(delay, sound_ms), self.root.destroy)
+            self._after(max(delay, sound_ms), self._destroy)
         else:
-            self.root.after(delay, self.go_home)
+            self._after(delay, self.go_home)
 
     def _quick_aborted(self):
         """An instant Extract Here was declined (or couldn't start)."""
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.refresh_choice()
             self.show(self.view_choice)
@@ -4234,8 +4318,11 @@ class ShredPackApp(object):
             self.dest_row.pack(fill="x")
             self.sub_chk.pack(anchor="w", pady=(px(8), 0))
         else:
-            self.lbl_section.config(
-                text="EXTRACT & FREE SPACE" if self.mode == "free" else "EXTRACT HERE")
+            if self.mode == "folder" and len(self.archives) == 1:
+                section = extract_to_label(first)
+            else:
+                section = "EXTRACT & FREE SPACE" if self.mode == "free" else "EXTRACT HERE"
+            self.lbl_section.config(text=section)
             stem = archive_stem(first) if len(self.archives) == 1 else "<archive name>"
             hint = shorten(os.path.join(folder, stem), 56) + "\\"
             if len(self.archives) > 1:
@@ -4263,7 +4350,7 @@ class ShredPackApp(object):
 
     def cancel_choice(self):
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -4293,7 +4380,7 @@ class ShredPackApp(object):
         (never overwrites or deletes anything)."""
         if not self._confirm_large([source]):
             if self.from_shell:
-                self.root.destroy()
+                self._destroy()
             else:
                 self.go_home()
             return
@@ -4387,7 +4474,7 @@ class ShredPackApp(object):
 
     def cancel_compress(self):
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -4483,7 +4570,7 @@ class ShredPackApp(object):
     def _finish_compress(self, result):
         if result["status"] == "cancelled":
             if self.compact:
-                self.root.destroy()
+                self._destroy()
                 return
             self.state = "compress_choice"
             self.show(self.view_compress)
@@ -4494,7 +4581,7 @@ class ShredPackApp(object):
             messagebox.showerror("%s - Compression failed" % APP_NAME, result["detail"],
                                  parent=self.root)
             if self.compact:
-                self.root.destroy()
+                self._destroy()
                 return
             self.state = "compress_choice"
             self.show(self.view_compress)
@@ -4592,7 +4679,7 @@ class ShredPackApp(object):
                     text += "\n\n" + "\n".join(notes)
                 messagebox.showinfo(APP_NAME, text, parent=self.root)
         if self.auto_test:
-            self.root.destroy()
+            self._destroy()
             return
         self._back_to_choice_view()
 
@@ -4655,7 +4742,7 @@ class ShredPackApp(object):
                 self.root.after_cancel(self._filter_job)
             except tk.TclError:
                 pass
-        self._filter_job = self.root.after(150, self._browse_filter)
+        self._filter_job = self._after(150, self._browse_filter)
 
     def _browse_filter(self):
         self._filter_job = None
@@ -4931,7 +5018,7 @@ class ShredPackApp(object):
     def on_close(self):
         if self.state == "processing":
             self.cancel.set()
-        self.root.destroy()
+        self._destroy()
 
     def _ask_password(self, name, retry):
         self.pw_event.clear()
@@ -4987,7 +5074,9 @@ class ShredPackApp(object):
                     if self.cancel.is_set():
                         raise Cancelled()
                     filtered = bool(opts.get("selected") or opts.get("include") or opts.get("exclude"))
-                    res.update(free_space_after_extraction(originals, before, ctx, outcome, filtered))
+                    expected = declared_file_sizes(source, password)
+                    res.update(free_space_after_extraction(
+                        originals, before, ctx, outcome, filtered, expected))
                 elif delete:
                     all_ok = True
                     for p in originals:
@@ -5007,7 +5096,7 @@ class ShredPackApp(object):
     def _ensure_poll(self):
         if not self._poll_active:
             self._poll_active = True
-            self.root.after(40, self._poll)
+            self._after(40, self._poll)
 
     def _poll(self):
         while True:
@@ -5022,7 +5111,7 @@ class ShredPackApp(object):
                 self._recover_from_error()
                 break
         if self.state == "processing":
-            self.root.after(40, self._poll)
+            self._after(40, self._poll)
         else:
             self._poll_active = False
 
@@ -5037,7 +5126,7 @@ class ShredPackApp(object):
         except Exception:  # noqa: BLE001
             pass
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -5151,7 +5240,7 @@ class ShredPackApp(object):
         self.archives = [a for a in self.archives if a not in finished]
         if not self.archives or self.compact:
             if self.from_shell:
-                self.root.destroy()
+                self._destroy()
             else:
                 self.go_home()
             return
@@ -5206,7 +5295,8 @@ def main():
             return
         app = ShredPackApp(root, from_shell=True)
         app.run_test_now(existing)
-        root.mainloop()
+        if app.alive:
+            root.mainloop()
         return
 
     if mode in ("compress-quick", "compress-dialog"):
@@ -5221,7 +5311,8 @@ def main():
         app = ShredPackApp(root, from_shell=True,
                            compact=(mode == "compress-quick" and len(existing) == 1))
         app.open_compress(existing, mode)
-        root.mainloop()
+        if app.alive:
+            root.mainloop()
         return
 
     if files:
@@ -5232,8 +5323,9 @@ def main():
             messagebox.showerror(APP_NAME, "The selected file couldn't be found:\n\n%s" % files[0])
             root.destroy()
             return
-        ShredPackApp(root, existing, mode, from_shell=True)
-        root.mainloop()
+        app = ShredPackApp(root, existing, mode, from_shell=True)
+        if app.alive:       # a declined question can already have closed the window
+            root.mainloop()
         return
 
     # Opened directly by the user: offer once to add the right-click menu, then show the app.
@@ -5271,8 +5363,9 @@ def main():
                 settings["menu_declined"] = True
                 save_settings(settings)
             root.deiconify()
-    ShredPackApp(root)
-    root.mainloop()
+    app = ShredPackApp(root)
+    if app.alive:
+        root.mainloop()
 
 
 if __name__ == "__main__":
