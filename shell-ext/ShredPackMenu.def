@@ -1,0 +1,4 @@
+LIBRARY ShredPackMenu
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
