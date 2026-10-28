@@ -359,6 +359,17 @@ check("a CLSID key that is not ours is never overwritten or removed",
       rf.get_value(sp.clsid_key(), "") == "Somebody else's class" and any("belongs to another" in w for w in warn))
 sp.set_registry(reg)
 
+
+# ---- --menu-status explains which label is in use ----
+rs = FakeRegistry(); sp.set_registry(rs); sp.install_menu()
+txt = sp.menu_status_text()
+check("menu status (no DLL): says the label is fixed and why", "NO" in txt and "fixed label" in txt and "no extension" in txt)
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    sp.install_menu(); txt = sp.menu_status_text()
+check("menu status (with DLL): says the file name is shown and where the extension is registered",
+      "file name" in txt and DLL in txt)
+sp.set_registry(reg)
+
 # ---- migration from every earlier layout ----
 for name, seeder in (("v1.1.0 (two cascades)", seed_v110), ("v1.0.x (cascade + folder item)", seed_v10x),
                      ("first version (single entry)", seed_first_layout)):
