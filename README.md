@@ -1,167 +1,225 @@
+<div align="center">
+
+<img src="assets/shredpack-icon.png" alt="ShredPack icon" width="112" height="112">
+
 # ShredPack
 
-A fast, self-contained archive tool for Windows with a dark, minimal interface.
-It reads and writes archives **with its own built-in engine** - it does not need
-WinRAR or 7-Zip installed, and it never launches another program to do the work.
+**An open-source archive tool for Windows. Extract, test and create archives with a built-in engine.**
 
-ShredPack only runs when you open it or pick one of its right-click options. It
-does the job and exits; nothing stays running in the background.
+[Download](https://github.com/Kchecksfiles/ShredPack/releases) &nbsp;·&nbsp; [Report a problem](https://github.com/Kchecksfiles/ShredPack/issues) &nbsp;·&nbsp; [Right-click menu](#right-click-menu) &nbsp;·&nbsp; [Extract & Free Space](#extract--free-space)
 
-## What it does
+<img src="assets/shredpack-logo-animation.gif" alt="The ShredPack icon slides left and the ShredPack wordmark appears" width="560">
 
-- **Extract** - right-click an archive, or drag it onto the window.
-  *Extract Here* always unpacks into a new folder named after the archive, so a
-  messy archive never spills loose files into the folder you're in. It starts at
-  once - no confirmation screen - using the options saved in **Settings**, shows a
-  small progress window only if the job takes a moment, and closes itself when it
-  is done (with a short sound, which you can turn off). *Extract files...* still
-  lets you choose the destination.
-- **Browse and extract selected files** - open an archive's contents, search
-  them, and extract only what you pick. Optional wildcard filters
-  (e.g. `*.jpg`). What to do if a file already exists (keep both / overwrite /
-  skip / overwrite if newer) is set once in **Settings**.
-- **Test archive** - verifies the contents (checksums and decompression)
-  without writing anything.
-- **Create archives** - right-click any file or folder (*Add to ZIP* for a
-  one-click `.zip`, or *Add to archive...* to choose format, name, level and
-  password), or use *Create Archive...* in the app. Drag files onto the window
-  to start.
-- **Checksums** - SHA-256, SHA-1, MD5 and CRC32 of any file, with a compare box
-  for a published checksum.
-- **Settings** (link in the top-right of the window; saved automatically):
-  whether *Extract Here* starts immediately, whether to **delete the original
-  archive after extraction** (moved to the Recycle Bin when possible - if you
-  extract only part of an archive, ShredPack asks first), what to do with files
-  that already exist, and whether to play the finish sound.
+</div>
 
-## Formats
+---
+
+## What it is
+
+ShredPack is a small desktop utility for people who just want to open, check and make archives. It is a convenient alternative to tools such as WinRAR: it does the work **itself**, so it does not need WinRAR or 7-Zip installed and never launches another program to do the job.
+
+It is MIT-licensed. The code contains no ads, no accounts and no licence checks. It runs only when you open it or pick one of its right-click options; it does its job and exits, and nothing stays running in the background.
+
+<!--
+SCREENSHOTS - add real ones, then uncomment this block (see assets/screenshots/README.md):
+
+<p align="center">
+  <img src="assets/screenshots/main-window.png" alt="The ShredPack main window" width="46%">
+  <img src="assets/screenshots/extract-options.png" alt="The extraction options screen" width="46%">
+</p>
+<p align="center">
+  <img src="assets/screenshots/context-menu.png" alt="The ShredPack entries in the Windows right-click menu" width="46%">
+  <img src="assets/screenshots/first-run-tour.png" alt="The first-run tour" width="46%">
+</p>
+-->
+
+## Features
+
+| | |
+|---|---|
+| **Extract** | Drag an archive onto the window, press **Extract**, or right-click it in Explorer. |
+| **Browse & pick** | Open an archive's contents, search them, and extract only what you select. Optional wildcard filters such as `*.jpg`. |
+| **Test** | Verifies every file (checksums and decompression) without writing anything. |
+| **Create** | ZIP, 7Z and TAR variants, with levels and passwords (ZIP/7Z). Right-click any file or folder, or use **Create**. |
+| **Checksums** | SHA-256, SHA-1, MD5 and CRC32 of any file, with a box to compare against a published value. |
+| **Extract & Free Space** | Extract an archive, then delete the original to get the disk space back. A separate, confirmed action. [Details](#extract--free-space) |
+| **Finish sound** | An optional short sound when a task finishes (Settings). |
+| **First-run tour** | Three short cards on first launch. Skippable, shown once. |
+
+Extraction is staged in a temporary folder first, so a failed or cancelled run leaves nothing behind. File names are sanitised (`..`, absolute paths, reserved Windows names and invisible text-direction characters are neutralised), existing files are only overwritten if you choose that in Settings, and symbolic links in archives are never created.
+
+## Supported formats
 
 | Format | Extract | Create | Notes |
-|---|---|---|---|
-| ZIP | yes | yes | Password-protected (including AES) when `pyzipper` is bundled; split ZIPs (`.z01`/`.zip`, `.zip.001`) |
-| 7Z | yes | yes | Needs `py7zr` (bundled in the release build) |
+|---|:---:|:---:|---|
+| ZIP | yes | yes | Password-protected ZIPs (including AES); split ZIPs (`.z01` + `.zip`, `.zip.001`) |
+| 7Z | yes | yes | |
 | TAR, TAR.GZ/TGZ, TAR.BZ2, TAR.XZ | yes | yes | |
-| GZ, BZ2, XZ (single file) | yes | - | |
-| ISO | yes | - | Needs `pycdlib` (bundled in the release build) |
-| CAB | yes | - | Stored and MSZIP only (not LZX/Quantum); multi-part cabinets unsupported |
-| XAR | yes | - | |
+| GZ, BZ2, XZ (single file) | yes | no | |
+| **RAR** | **yes** | **no** | RAR3 and RAR5. See [RAR](#rar) below. |
+| ISO | yes | no | |
+| CAB | yes | no | Stored and MSZIP only (not LZX/Quantum); multi-part cabinets unsupported |
+| XAR | yes | no | |
 
-**Not supported:** RAR, WIM, DMG, VHD/VHDX. ShredPack deliberately doesn't depend
-on other programs, and there is no free pure-Python RAR extractor.
+**Not supported:** WIM, DMG, VHD/VHDX. ShredPack can **read** RAR archives but **cannot create** them.
+
+### RAR
+
+RAR extraction uses [`unrar-cffi`](https://pypi.org/project/unrar-cffi/), a binding to RARLAB's UnRAR source code. That licence allows free redistribution for extraction and forbids using the code to create RAR archives, which ShredPack never does. What has been checked, using sample archives:
+
+- RAR3 and RAR5 archives, solid archives, nested folders and non-ASCII names
+- Password-protected files: asks for the password, reports a wrong one, extracts with the right one
+- Damaged and truncated archives fail with a message and leave no partial output
+- Multi-part sets: open the **first** part (`.part1.rar`) with all parts in the same folder; opening a later part explains this
+
+Limits: archives that encrypt their **file names** can't be opened, and **Extract & Free Space never deletes multi-part RAR sets**. The RAR checks above were run on Linux; the Windows build compiles the library during the GitHub Actions build. If that step ever fails, the build is produced without RAR and the app says *"RAR support isn't included in this build"* instead of failing.
 
 ## Install
 
-Download **`ShredPack-Setup.exe`** from the
-[Releases](https://github.com/Kchecksfiles/ShredPack/releases) page and run it.
-It installs per user (no administrator rights needed), adds the right-click menu
-(optional) and an entry in *Settings > Apps* for uninstalling. A portable
-`ShredPack.exe` is published too; run it once and use the *Add to menu* button.
-(The installed app is a folder build, which opens faster than the single-file
-portable exe - that one unpacks itself again on every start.)
-Each release includes `SHA256SUMS.txt` (one line per file: the SHA-256 hash, two
-spaces, the file name) so you can verify your download. The release workflow
-generates it from the exact files it publishes, checks it against them, then
-downloads the published assets back from the release and checks them again - the
-build fails if any of the three files is missing, differs from what was built,
-or doesn't verify. (Releases published before this workflow existed have no
-`SHA256SUMS.txt`; the app's *Checksum...* button can hash those files.)
+**Installer (recommended).** Download `ShredPack-Setup.exe` from [Releases](https://github.com/Kchecksfiles/ShredPack/releases) and run it. It installs for your user (no administrator rights needed unless you choose an all-users install), can add the right-click menu, and adds an entry to *Settings > Apps* for uninstalling. Uninstalling removes the right-click entries ShredPack created.
 
-To verify, hash the file you downloaded and compare it with its line in
-`SHA256SUMS.txt` (the app's own *Checksum...* button does the same):
+**Portable.** Download `ShredPack.exe` and run it anywhere. On first launch it offers to add the right-click menu; if you say no, it won't ask again. The portable file unpacks itself on each start, so the installed app opens a little faster.
 
-```
+Each release also lists `SHA256SUMS.txt`. To verify a download:
+
+```powershell
 Get-FileHash .\ShredPack-Setup.exe -Algorithm SHA256
 ```
 
-On Windows 11 the entries appear under **Show more options** in the right-click menu.
+> **SmartScreen:** the builds are not code-signed, so Windows may show "Windows protected your PC" the first time. Choose *More info > Run anyway* if you trust the source, and compare the checksum above.
 
-> **Windows SmartScreen:** the builds are not code-signed yet, so Windows may show
-> "Windows protected your PC" the first time. Choose *More info > Run anyway* if
-> you trust the source (verify the checksum above).
+## Getting started
 
-## Safety
+1. **Open ShredPack.** On the first launch a three-step tour appears under the buttons. Press **Next** twice and **Done**, or **Skip tour**. It does not come back unless you ask for it in **Settings**.
+2. **Extract:** drop an archive on the big box, or press **Extract** and choose one.
+3. **Choose where it goes** (for *Extract files*), tick any filters, and press **Extract**. Use **Browse** first to look inside, or **Test** to verify without extracting.
+4. **Create:** press **Create**, add files or a folder, pick a format, and press **Compress**.
+5. **Settings** (top right) controls what happens to files that already exist, whether *Extract Here* starts immediately, and the finish sound. Changes save automatically to `%APPDATA%\ShredPack\settings.json`.
 
-- File names are sanitised: `..` and absolute paths, invalid or reserved Windows
-  names, and invisible text-direction characters used to disguise `.exe` as
-  `.jpg` are neutralised.
-- Existing files are never overwritten unless you choose *Overwrite*.
-- Extraction happens in a temporary folder first; a failed or cancelled run
-  leaves nothing behind.
-- Symbolic links in archives are never created (links to a file inside the same
-  archive become copies); links and junctions are never followed when creating
-  archives.
-- Extracted files inherit the archive's "downloaded from the internet" mark, so
-  SmartScreen still warns before an extracted download runs.
-- Archives that would expand enormously or not fit on the disk trigger a warning
-  first.
-- Nothing is sent anywhere. On a normal launch (not from the right-click menu) the
-  app fetches a small version file from GitHub to show an "update available"
-  link. Errors are logged locally to `%APPDATA%\ShredPack\log.txt`.
+## Right-click menu
+
+Right-click an **archive** in Explorer:
+
+| Entry | What it does |
+|---|---|
+| **Extract files...** | Opens the options screen so you choose the destination |
+| **Extract Here** | Starts at once, into a new folder named after the archive, next to it |
+| **Extract to `<archive name>\`** | Extracts into a folder named after the archive |
+| **Open with ShredPack >** | A submenu: **Extract & Free Space...**, **Test archive**, **Add to ZIP**, **Add to archive...** |
+
+Right-click any **other file or folder**: **Open with ShredPack >** **Add to ZIP** / **Add to archive...**.
+
+Things to know:
+
+- The third entry reads literally `Extract to <archive name>\`. A registry-based Windows menu can't show each archive's real name; that would need a compiled shell extension, which ShredPack doesn't install. Today it does the same thing as *Extract Here* (a new folder named after the archive).
+- On Windows 11 the entries are under **Show more options**.
+- The menu works on **one selected item at a time**. To combine several items into one archive, use **Create** or drag them onto the window.
+- The entries are registered for your user account only (nothing needs administrator rights). The installer registers them and removes them on uninstall. They are stored in the registry, so they stay across restarts.
+- From the command line: `ShredPack.exe --install` registers the menu and `ShredPack.exe --uninstall` removes only ShredPack's own entries.
+
+## Extract & Free Space
+
+*Extract, then delete the original archive to reclaim disk space.* It is a **separate action**: ordinary extraction never deletes anything. It does not compress anything and does not make the extracted files smaller; it only removes the archive once you have the files.
+
+Find it as the **Extract & Free Space** button on the options screen, or in the right-click menu under **Open with ShredPack**. From the right-click menu the files go into a new folder named after the archive.
+
+**What it does, in order**
+
+1. Shows a warning that the archive will be **permanently deleted** (not sent to the Recycle Bin, because a Recycle Bin copy would free no space) and asks you to confirm. The default answer is *No*.
+2. Extracts **everything** in the archive. It refuses to run with a selection or filters, because the rest of the archive would be lost.
+3. Checks the result. The archive is deleted **only if every check passes**:
+   - extraction finished without error and was not cancelled
+   - the archive contained at least one file, and every file was written and is present
+   - no file was skipped because one with that name already existed
+   - the archive did not change (size and modified time) while it was being extracted
+   - the extraction did not overwrite the archive itself, and the archive is a normal file, not a link
+   - it is not part of a multi-part RAR set
+4. If any check fails, the **archive is kept** and you are told why. If everything passes but the delete itself fails (for example the file is open in another program or read-only), **the extracted files are kept** and you are told that the archive couldn't be deleted.
+5. Split ZIPs: all parts are deleted together, or none.
+
+The check is only as deep as the format's reader allows: it confirms every file was decompressed and written without error and is present on disk. It does not compare the extracted files byte-for-byte against another source.
+
+The older **Settings > Delete the original archive after a successful extraction** option is a different feature: it is off by default, sends the archive to the Recycle Bin when possible, and does not run the checks above. If you want the safeguards, use Extract & Free Space.
+
+## Requirements and compatibility
+
+- **Windows.** The release is built on GitHub's `windows-latest` runner; the project doesn't publish a tested-versions list, so none is claimed here. The window uses a dark title bar where Windows supports it.
+- No installation of WinRAR, 7-Zip or other tools is needed. Everything the app uses is bundled in the release.
+- Disk space: ShredPack warns before extracting an archive that looks like a decompression bomb or won't fit on the destination drive.
+- Network: when you open the app directly it fetches one small version file from GitHub to show an "update available" link. Right-click actions don't. The code makes no other network requests. Errors are logged locally to `%APPDATA%\ShredPack\log.txt`.
+
+## Troubleshooting and FAQ
+
+**The right-click entries are missing.** On Windows 11, look under *Show more options*. If they're still missing, run `ShredPack.exe --install` (or re-run the installer and keep *Add ShredPack to the right-click menu* ticked). If you declined the first-launch prompt in the portable exe, `--install` is how to add them later.
+
+**"RAR support isn't included in this build."** That build was produced without the RAR component. Use the official release, or see the build notes below.
+
+**A RAR archive asks for a password forever / says file names are encrypted.** Archives that hide their file names can't be opened by ShredPack. Ordinary password-protected RAR files work.
+
+**A RAR opens but says "later part of a multi-part set".** Open the first part (`name.part1.rar`) with every part in the same folder.
+
+**Extract & Free Space kept my archive.** The message names the reason (partial extraction, a skipped file, the archive changed, a multi-part RAR, and so on). Nothing was deleted; the extracted files are in place.
+
+**Can ShredPack create RAR files?** No. It only extracts RAR.
+
+**Where are my settings and the log?** `%APPDATA%\ShredPack\settings.json` and `%APPDATA%\ShredPack\log.txt`.
+
+**How do I see the tour again?** Settings > *Show the quick tour again* (button).
+
+**Windows says "protected your PC".** See the SmartScreen note under [Install](#install).
 
 ## Known limitations
 
-- The Explorer menu text is fixed (it can't show the archive's name) and works on
-  **one selected item at a time**; combining many items into one archive is done
-  in the app with *Add Files... / Add Folder...* or by dragging them in. A
-  multi-select, name-aware menu needs a compiled shell extension.
+- The right-click menu text is fixed and works on one selected item at a time (see above).
 - Executable bits and ownership aren't restored (they don't exist on Windows).
-- Browsing split archives and previewing files are not implemented yet.
+- Browsing split archives and previewing files are not implemented.
+- The right-click menu, the Windows installer and the redesigned interface can only be fully exercised on Windows; the automated tests run on a stand-in for the registry and for Tk.
 
 ## Build from source
 
-```
-pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash pyinstaller
+```bat
+pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash unrar-cffi pyinstaller
 :: portable single file -> dist\ShredPack.exe
 pyinstaller --noconsole --onefile --icon=shredpack.ico --add-data "shredpack.ico;." ^
   --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 ^
+  --hidden-import unrar.cffi.unrarlib --hidden-import unrar.cffi._unrarlib --hidden-import _cffi_backend ^
   --name ShredPack shredpack.py
 :: the app the installer ships (a folder, opens faster) -> dist-app\ShredPack\
 pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app ^
   --icon=shredpack.ico --add-data "shredpack.ico;." ^
   --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 ^
+  --hidden-import unrar.cffi.unrarlib --hidden-import unrar.cffi._unrarlib --hidden-import _cffi_backend ^
   --name ShredPack shredpack.py
 ```
 
-The installer is built from `setup.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php).
-Pass the version from `shredpack.py`: `ISCC.exe /DMyAppVersion=x.y.z setup.iss`
-(x.y.z = `APP_VERSION`; the file's own fallback is only for quick local builds).
+`unrar-cffi` is optional: leave it out (and its three `--hidden-import` flags) and the build simply has no RAR support. PyPI has no prebuilt Windows wheel of `unrar-cffi` for current Python versions, so `pip` compiles it and needs the Visual C++ build tools.
+
+The installer is built from `setup.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php): `ISCC.exe /DMyAppVersion=x.y.z setup.iss` (x.y.z = `APP_VERSION` in `shredpack.py`). The installer calls `ShredPack.exe --install` after copying files and `--uninstall` before removing them; the app icon is `shredpack.ico`.
 
 ### Releases
 
-`.github/workflows/build.yml` is the only workflow. It runs the tests, builds the
-portable `dist/ShredPack.exe` and the installer `Output/ShredPack-Setup.exe`, writes and
-verifies `SHA256SUMS.txt`, and uploads the three files as the `ShredPack-release`
-workflow artifact. It attaches them to a version release (`vX.Y.Z`) only when asked, and
-never touches the old rolling `latest` pre-release:
+`.github/workflows/build.yml` runs the tests, builds the portable `ShredPack.exe` and the installer `ShredPack-Setup.exe`, writes and verifies `SHA256SUMS.txt`, and uploads the three files as the `ShredPack-release` workflow artifact. It attaches them to a version release (`vX.Y.Z`) only when asked:
 
-- **Pushes to `main`, pull requests, and manual runs with `publish` unticked (the
-  default):** test build only. Nothing is published and no tag or release is created
-  or changed.
-- **Push a tag** such as `v1.2.0`: the tag must equal `v` + `APP_VERSION`, and must point
-  at the commit being built. The release is created if the tag has none; if it exists
-  with no files, the three files are attached to it; if it already has files, the run fails.
-- **Actions > Build ShredPack > Run workflow** (on `main`) with `publish` ticked: the
-  same rules. If the tag doesn't exist the run fails unless `create_tag` is also ticked
-  (then it creates the tag at this commit and a new release). Files already on the release
-  are only replaced if `overwrite` is ticked. A draft release for the tag is refused.
+- **Pushes to `main`, pull requests, and manual runs with `publish` unticked (the default):** test build only. Nothing is published and no tag or release is created or changed.
+- **Push a tag** such as `v1.2.0`: the tag must equal `v` + `APP_VERSION` and point at the commit being built. The release is created if the tag has none; if it exists with no files, the three files are attached; if it already has files, the run fails.
+- **Actions > Build ShredPack > Run workflow** (on `main`) with `publish` ticked: the same rules. A missing tag fails unless `create_tag` is ticked; existing files are replaced only if `overwrite` is ticked; a draft release is refused.
 
-After publishing, the workflow downloads the release's assets back and checks them
-against the build again. `VERSION.txt` must equal `APP_VERSION` (it drives the in-app
-update link, so update both together).
+`VERSION.txt` must equal `APP_VERSION` (it drives the in-app update link), so change both together.
 
 ## Tests
 
 ```
-python tests/test_shredpack.py       # engine: every format, selection, links, integrity, menu registration, ...
+python tests/test_shredpack.py       # engine: formats, RAR, selection, links, integrity, Extract & Free Space checks, menu registration
 python tests/ui_smoke.py             # drives the UI logic with stand-in widgets
-python tests/test_ui_event_loop.py   # the real app inside a stand-in Tk event loop (incl. right-click launches)
+python tests/test_ui_event_loop.py   # the app inside a stand-in Tk event loop (incl. right-click launches)
 ```
 
-The tests use only the standard library, so the optional 7Z/ISO/AES code paths are
-exercised by hand rather than in CI.
+The tests need only the standard library. With `py7zr` and `unrar-cffi` installed, the 7Z and RAR tests run too; without them those tests are reported as skipped.
 
-## Licenses
+## Contributing
 
-See `LICENSE` for ShredPack itself. The release build bundles third-party packages
-(`py7zr`, `pycdlib`, `pyzipper`, `tkinterdnd2`, `send2trash`) under their own
-licenses; check each project's current terms before redistributing binaries.
+Issues and pull requests are welcome at [github.com/Kchecksfiles/ShredPack](https://github.com/Kchecksfiles/ShredPack). Please run the three test files above before opening a pull request.
+
+## Licences
+
+ShredPack is MIT-licensed; see `LICENSE`. The release bundles third-party packages (`py7zr`, `pycdlib`, `pyzipper`, `tkinterdnd2`, `send2trash`, and `unrar-cffi` with the UnRAR source) under their own licences; check each project's current terms before redistributing binaries. The RAR test archives in `tests/rar_samples.py` come from the [rarfile](https://github.com/markokr/rarfile) project (ISC licence).

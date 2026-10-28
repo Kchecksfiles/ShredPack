@@ -3,7 +3,10 @@
 ; Build order (e.g. in your GitHub Action):
 ;   1. pyinstaller --noconsole --onedir --distpath dist-app --workpath build-app
 ;        --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib
-;        --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
+;        --collect-all pyzipper --collect-all tkinterdnd2
+;        --hidden-import unrar.cffi.unrarlib --hidden-import unrar.cffi._unrarlib
+;        --hidden-import _cffi_backend            (these three add RAR support)
+;        --name ShredPack shredpack.py
 ;      -> produces the folder dist-app\ShredPack\ (ShredPack.exe + _internal\)
 ;      A folder build opens faster than --onefile, which unpacks itself into %TEMP% on every start.
 ;   2. "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=x.y.z setup.iss
@@ -12,7 +15,9 @@
 ; This script does NOT register the right-click menu itself. It calls
 ; "ShredPack.exe --install" after copying files, and "--uninstall" before
 ; removing them, so the registry always points at the fixed install folder
-; below and never breaks if the user moves anything.
+; below and never breaks if the user moves anything. The menu lives in the current user's
+; registry (HKCU); --uninstall removes only keys ShredPack created. The setup icon, the
+; installed exe and the window all use shredpack.ico (the blue ShredPack icon).
 
 #define MyAppName "ShredPack"
 ; The build workflow passes the real version in with /DMyAppVersion=..., read from
@@ -49,7 +54,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "contextmenu"; Description: "Add ""Extract with ShredPack"" to the right-click menu"; GroupDescription: "Windows integration:"; Flags: checkedonce
+Name: "contextmenu"; Description: "Add ShredPack to the right-click menu (Extract files, Extract Here, Open with ShredPack)"; GroupDescription: "Windows integration:"; Flags: checkedonce
 
 [Files]
 Source: "dist-app\ShredPack\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
