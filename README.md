@@ -113,6 +113,7 @@ Things to know:
 
 - **Installer:** the third entry shows the name of the archive you right-clicked (`Extract to GTA V.zip`), supplied by a small native Explorer extension (`ShredPackMenu.dll`, source in `shell-ext/`) that the installer places next to `ShredPack.exe` and `ShredPack.exe --install` registers. Clicking it starts at once and extracts into a new folder named after the archive, the same as *Extract Here*. If several archives are selected, or if the extension isn't present (see next point), the entry reads `Extract to <archive name>\`.
 - **Portable exe, or a build where the extension failed to build:** the entry keeps the fixed label `Extract to <archive name>\`. A registry-only menu cannot show a per-file name, and a single-file exe cannot ship a DLL. The extension is built and self-tested by the Windows CI; if that step fails the installer is built without it and the CI log shows a warning.
+- To see which label a copy uses and why, run `ShredPack.exe --menu-status`.
 - Explorer keeps the extension loaded, so upgrading or uninstalling while Explorer has used it may finish after the next restart (or after restarting Explorer).
 - On Windows 11 the entries are under **Show more options**.
 - The menu works on **one selected item at a time**. To combine several items into one archive, use **Create** or drag them onto the window.

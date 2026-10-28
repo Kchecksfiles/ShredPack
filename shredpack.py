@@ -3350,6 +3350,36 @@ def install_menu():
     return warnings
 
 
+def menu_status_text():
+    """Plain-language report on why 'Extract to ...' shows a file name or the generic label."""
+    dll = menu_dll_path()
+    reg = registry()
+    lines = ["ShredPack %s" % APP_VERSION, "Program: %s" % sys.executable,
+             "Explorer extension (%s) next to the program: %s" % (MENU_DLL_NAME, "yes" if dll else "NO")]
+    if reg is None:
+        lines.append("Registry: not available on this system")
+        return "\n".join(lines)
+    verb = ext_verb_key(".zip", "ShredPack3Folder")
+    handler = reg.get_value(verb, "ExplorerCommandHandler")
+    lines.append("Menu registered: %s" % install_state())
+    lines.append("'Extract to' entry on .zip files uses: %s" % (
+        "the Explorer extension (shows the archive's file name)" if handler else
+        "a fixed label (%s)" % (reg.get_value(verb, "MUIVerb") or "not registered")))
+    if handler:
+        server = reg.get_value(clsid_key() + "\\InprocServer32", "")
+        lines.append("Extension registered at: %s" % (server or "NOT REGISTERED"))
+        if server and not os.path.isfile(server):
+            lines.append("WARNING: that file no longer exists")
+    if not dll:
+        lines.append("")
+        lines.append("This copy has no extension, so the label stays generic. Install with ShredPack-Setup.exe "
+                     "from a build where the 'Explorer menu extension' CI step succeeded.")
+    elif not handler:
+        lines.append("")
+        lines.append("The extension is present but not registered: run ShredPack.exe --install, then reopen Explorer.")
+    return "\n".join(lines)
+
+
 def install_state():
     """'none' (nothing of ours), 'stale' (older layout, changed, or another
     location) or 'current'."""
@@ -5345,6 +5375,12 @@ def main():
             return
         if a == "--uninstall":
             uninstall_menu()
+            return
+        if a == "--menu-status":
+            root = make_root(False)
+            root.withdraw()
+            messagebox.showinfo(APP_NAME + " - right-click menu status", menu_status_text(), parent=root)
+            root.destroy()
             return
         if a == "--mode" and i + 1 < len(args):
             valid = ("dialog", "here", "folder", "free", "test", "compress-quick", "compress-dialog")
