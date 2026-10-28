@@ -173,6 +173,31 @@ jobs:
           pyinstaller --noconsole --onedir --noconfirm --distpath dist-app --workpath build-app --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib --collect-all pyzipper --collect-all tkinterdnd2 @rar --exclude-module sqlite3 --exclude-module pydoc_data --exclude-module lib2to3 --exclude-module turtle --exclude-module idlelib --name ShredPack shredpack.py
           if ($LASTEXITCODE -ne 0) { throw "PyInstaller (folder build) failed with exit code $LASTEXITCODE" }
 
+      # The Explorer menu extension: a small native DLL that makes the right-click entry read
+      # "Extract to <the clicked archive's file name>" (a registry entry can only hold fixed text).
+      # It is built with the runner's Visual C++ tools and self-tested (titles, Invoke). If either
+      # fails, the installer is built WITHOUT it and keeps the fixed label - a warning is printed.
+      # The self-test cannot prove that Explorer shows the label; check that by hand on Windows.
+      - name: Build and test the Explorer menu extension (ShredPackMenu.dll)
+        shell: pwsh
+        run: |
+          $ok = $false
+          try {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $vs) { throw "Visual Studio C++ tools not found" }
+            $env:VCVARS = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+            cmd /c "shell-ext\build.bat"
+            if ($LASTEXITCODE -ne 0) { throw "compile or self-test failed (exit code $LASTEXITCODE)" }
+            if (-not (Test-Path "shell-ext\out\ShredPackMenu.dll")) { throw "ShredPackMenu.dll was not produced" }
+            Copy-Item "shell-ext\out\ShredPackMenu.dll" "dist-app\ShredPack\ShredPackMenu.dll"
+            $ok = $true
+          } catch {
+            Write-Host "::warning::Explorer menu extension NOT built ($_). The installer will keep the fixed 'Extract to <archive name>' label."
+          }
+          $global:LASTEXITCODE = 0
+          if ($ok) { Write-Host "Explorer menu extension: INCLUDED" } else { Write-Host "Explorer menu extension: not included" }
+
       - name: Ensure Inno Setup 6 is available
         shell: pwsh
         run: |
