@@ -185,6 +185,7 @@ jobs:
           try {
             $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $vs) { $vs = & $vswhere -latest -products * -property installationPath }
             if (-not $vs) { throw "Visual Studio C++ tools not found" }
             $env:VCVARS = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
             cmd /c "shell-ext\build.bat"
