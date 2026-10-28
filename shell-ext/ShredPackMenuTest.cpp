@@ -14,6 +14,8 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <stdio.h>
+#include <io.h>
+#include <fcntl.h>
 #include <string>
 #include <vector>
 
@@ -70,6 +72,7 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
+    _setmode(_fileno(stdout), _O_U8TEXT);        // print Unicode names without code-page errors
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::wstring dir = DirOfSelf();
     HMODULE dll = LoadLibraryW((dir + L"\\ShredPackMenu.dll").c_str());
@@ -105,7 +108,7 @@ int wmain(int argc, wchar_t** argv)
         {L"My Files.7z", L"Extract to My Files.7z"},
         {L"Backup.rar", L"Extract to Backup.rar"},
         {L"Game.tar.gz", L"Extract to Game.tar.gz"},
-        {L"Zürich 日本 \U0001F600.zip", L"Extract to Zürich 日本 \U0001F600.zip"},
+        {L"Z\u00fcrich \u65e5\u672c \U0001F600.zip", L"Extract to Z\u00fcrich \u65e5\u672c \U0001F600.zip"},
         {L"R&D Notes.zip", L"Extract to R&&D Notes.zip"},       // '&' is a menu accelerator: doubled
     };
     for (const Case& c : cases) {
@@ -124,7 +127,7 @@ int wmain(int argc, wchar_t** argv)
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         IShellItemArray* arr = ArrayFor(path);
         std::wstring got = arr ? TitleOf(cmd, arr) : L"";
-        bool ok = got.size() < longName.size() && got.rfind(L"Extract to ", 0) == 0 && got.find(L'…') != std::wstring::npos
+        bool ok = got.size() < longName.size() && got.rfind(L"Extract to ", 0) == 0 && got.find(L'\u2026') != std::wstring::npos
                   && got.size() >= 4 && got.compare(got.size() - 4, 4, L".zip") == 0;
         Check(ok, L"a very long name is shortened with an ellipsis and keeps its extension", got);
         if (arr) arr->Release();
