@@ -497,6 +497,34 @@ if shutil.which("zip"):
 else:
     skip("encrypted ZIP tests (the 'zip' program isn't installed)")
 
+# A wrong ZipCrypto password passes the 1-byte check about 1 time in 256 and then decrypts to
+# garbage. That has to read as "wrong password, try again" - never as a corrupted archive.
+# (Deterministic version of the 30-password loop above, which only hit it by luck.)
+import threading as _threading, zlib as _zlib
+
+
+class _GarbageZip(object):
+    def open(self, info, pwd=None):
+        raise _zlib.error("Error -3 while decompressing data: invalid block type")
+
+
+def _verify_entry(flag_bits, pw):
+    info = zipfile.ZipInfo("s.txt")
+    info.flag_bits = flag_bits
+    try:
+        sp._verify_zip_entry(_GarbageZip(), info, pw, sp.Ctx(_threading.Event(), lambda p, d, t: None))
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    return None
+
+
+e = _verify_entry(0x1, b"wrong")
+check("encrypted entry + wrong password that decrypts to garbage -> 'try again'",
+      isinstance(e, sp.NeedPassword) and e.retry)
+e = _verify_entry(0x0, None)
+check("a plain (unencrypted) entry with garbage data is still 'corrupted'",
+      isinstance(e, sp.ArchiveError) and "corrupted" in str(e))
+
 d = fresh("aes")
 z = os.path.join(d, "aes.zip")
 zi = zipfile.ZipInfo("a.txt")
@@ -509,7 +537,7 @@ raw = bytearray(open(z, "rb").read())
 struct.pack_into("<H", raw, hdr + 6, raw[hdr + 6] | 1)               # set the 'encrypted' flag
 struct.pack_into("<H", raw, cd + 8, raw[cd + 8] | 1)
 open(z, "wb").write(raw)
-if sp.pyzipper is None:
+if not sp.pyzipper:
     e = expect_error(z, sp.Unsupported, password="x")
     check("AES zip without pyzipper: clear 'not included' message", isinstance(e, sp.Unsupported)
           and "AES" in str(e))

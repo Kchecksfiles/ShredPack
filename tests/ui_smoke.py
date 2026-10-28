@@ -44,6 +44,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import shredpack as sp
 sp.VERSION_URL = ""      # no network in tests
 sp.log_write = lambda *a, **k: None
+SETTINGS_DIR = tempfile.mkdtemp(prefix="shredpack_settings_")   # never touch the real settings
+sp.settings_path = lambda: os.path.join(SETTINGS_DIR, "settings.json")
 
 ok = []
 def check(label, cond):
@@ -83,11 +85,95 @@ check("app builds and starts at home", app.state == "home")
 
 # ---- normal extraction, options defaults ----
 d = fresh("ex"); z = os.path.join(d, "a.zip"); make_zip(z, {"x.txt": "X", "sub/y.txt": "Y"})
+app.settings["quick_here"] = False          # the confirmation screen is optional now
 app.open_archives([z], "here")
 check("choice screen reached", app.state == "choice")
 app.begin(); pump(app, {"finished"})
 check("extract here -> named folder", sorted(os.listdir(os.path.join(d, "a"))) == ["sub", "x.txt"])
 check("done screen shown", app.state == "finished")
+app.settings["quick_here"] = True
+
+# ---- instant Extract Here (the new default) ----
+check("instant Extract Here is on by default", sp.SETTINGS_DEFAULTS["quick_here"] is True)
+d = fresh("quick"); z = os.path.join(d, "q.zip"); make_zip(z, {"a.txt": "A"})
+app.go_home(); app.open_archives([z], "here")
+check("Extract Here starts at once (no confirmation screen)", app.state == "processing")
+pump(app, {"finished"})
+check("...into the folder named after the archive", os.listdir(os.path.join(d, "q")) == ["a.txt"])
+app.go_home(); app.open_archives([z], "dialog")
+check("Extract files... still shows its dialog", app.state == "choice")
+check("...which summarises the saved options", "Delete original: no" in str(app.lbl_opts.config.call_args))
+
+# saved settings are honoured by the instant path
+app.settings.update(delete_after=True, overwrite="skip")
+d = fresh("quickdel"); z = os.path.join(d, "k.zip"); make_zip(z, {"a.txt": "A"})
+app.go_home(); app.open_archives([z], "here"); pump(app, {"finished"})
+check("delete-after setting applied", not os.path.exists(z) and os.path.isdir(os.path.join(d, "k")))
+check("overwrite setting reaches the dialog variables", app.overwrite_var.get() == dict(sp.OVERWRITE_POLICIES)["skip"])
+app.settings.update(delete_after=False, overwrite="rename")
+
+# declining a safety warning during an instant extract returns to the confirmation screen
+d = fresh("quickwarn"); z = os.path.join(d, "w.zip"); make_zip(z, {"a.txt": "A"})
+messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
+with mock.patch.object(sp, "preflight_risk", return_value="Test warning: looks risky"):
+    app.go_home(); app.open_archives([z], "here")
+check("declined warning: nothing extracted, back on the confirmation screen",
+      app.state == "choice" and not os.path.exists(os.path.join(d, "w")))
+check("...and the warning was shown", messagebox.askyesno.called)
+messagebox.askyesno.return_value = True
+
+# ---- settings screen + storage ----
+check("settings default to the documented values", sp.load_settings() == sp.SETTINGS_DEFAULTS)
+app.go_home(); app.open_settings()
+check("Settings opens from home", app.state == "settings")
+app.set_quick_var.set(False); app.set_delete_var.set(True); app.set_sound_var.set(False)
+app.set_overwrite_var.set(dict(sp.OVERWRITE_POLICIES)["newer"]); app._settings_changed()
+saved = sp.load_settings()
+check("changes are saved to disk at once", saved == {"quick_here": False, "delete_after": True,
+                                                       "overwrite": "newer", "sound": False})
+app.close_settings()
+check("Done returns home", app.state == "home")
+app.settings = sp.load_settings()
+d = fresh("setchoice"); z = os.path.join(d, "c.zip"); make_zip(z, {"a.txt": "A"})
+app.open_archives([z], "here")
+check("quick off -> Extract Here shows the confirmation screen again", app.state == "choice")
+check("...pre-filled from Settings", app.delete_var.get() is True and
+      app.overwrite_var.get() == dict(sp.OVERWRITE_POLICIES)["newer"])
+app.open_settings(); app.set_delete_var.set(False); app.close_settings()
+check("Settings opened from the choice screen returns to it", app.state == "choice" and app.delete_var.get() is False)
+check("Escape closes Settings", (app.open_settings(), app.on_escape(), app.state)[2] == "choice")
+open(sp.settings_path(), "w").write("{ not json")
+check("a damaged settings file falls back to defaults", sp.load_settings() == sp.SETTINGS_DEFAULTS)
+open(sp.settings_path(), "w").write('{"quick_here": "yes", "overwrite": "explode", "sound": false}')
+check("invalid values are ignored, valid ones kept", sp.load_settings() == dict(sp.SETTINGS_DEFAULTS, sound=False))
+os.remove(sp.settings_path()); app.settings = dict(sp.SETTINGS_DEFAULTS)
+
+# ---- completion sounds ----
+import wave
+for style in ("glass", "pop", "chord", "error"):
+    data, ms = sp.synth_sound(style)
+    w = wave.open(io.BytesIO(data))
+    check("sound '%s' is a valid WAV, %d ms" % (style, ms),
+          w.getnchannels() == 1 and w.getframerate() == 44100 and abs(w.getnframes() / 44100.0 * 1000 - ms) < 2)
+    raw = w.readframes(w.getnframes())
+    import struct as _st
+    samples = _st.unpack("<%dh" % w.getnframes(), raw)
+    check("sound '%s': quiet (peak %.0f%%), starts and ends at silence" % (style, 100.0 * max(map(abs, samples)) / 32767),
+          max(map(abs, samples)) / 32767.0 < 0.40 and samples[0] == 0 and samples[-1] == 0)
+check("play_sound is a silent no-op where winsound doesn't exist", sp.play_sound("done") == 0)
+
+# Windows path, with a fake winsound: it must NOT combine SND_MEMORY with SND_ASYNC (that raises
+# RuntimeError on real Windows) - the in-memory WAV plays synchronously on a background thread.
+calls = []
+fake_ws = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, PlaySound=lambda data, flags: calls.append((data, flags)))
+with mock.patch.dict(sys.modules, {"winsound": fake_ws}), mock.patch.object(sp.sys, "platform", "win32"):
+    sp._sound_cache.clear()
+    ms = sp.play_sound("done")
+    deadline = time.time() + 5
+    while not calls and time.time() < deadline: time.sleep(0.01)
+check("play_sound (Windows path) returns the chime length and plays from memory",
+      ms > 300 and len(calls) == 1 and calls[0][0][:4] == b"RIFF" and calls[0][1] == fake_ws.SND_MEMORY)
+sp._sound_cache.clear()
 
 # ---- selection from browser + delete guard ----
 d = fresh("sel"); z = os.path.join(d, "s.zip"); make_zip(z, {"a.txt": "A", "dir/b.txt": "B", "dir/c.txt": "C"})

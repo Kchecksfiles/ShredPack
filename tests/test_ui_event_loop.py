@@ -83,6 +83,8 @@ import shredpack as sp  # noqa: E402
 
 sp.VERSION_URL = ""
 sp.log_write = lambda *a, **k: None
+SETTINGS_DIR = tempfile.mkdtemp(prefix="shredpack_settings_")   # never touch the real settings
+sp.settings_path = lambda: os.path.join(SETTINGS_DIR, "settings.json")
 
 ok, skipped = [], []
 
@@ -298,8 +300,7 @@ d = fresh("ops")
 z = os.path.join(d, "x.zip")
 make_zip(z, {"a.txt": "A", "sub/b.txt": "B"})
 app, loop = in_app()
-app.open_archives([z], "here")
-app.begin()
+app.open_archives([z], "here")              # instant by default: no confirmation screen, no begin()
 done = loop.run(until=lambda: app.state == "home", limit=15)
 check("extract: completes and returns home", done)
 check("extract: files extracted into a folder named after the archive",
@@ -327,6 +328,60 @@ app, loop = in_app()
 app.open_compress([folder], "dialog")
 app.begin_compress()
 check("compress dialog: completes", loop.run(until=lambda: app.state == "home", limit=15))
+
+# ---- instant Extract Here, the way Explorer launches it --------------------------------------
+d = fresh("quickhere")
+z = os.path.join(d, "fast.zip")
+make_zip(z, {"a.txt": "A", "sub/b.txt": "B"})
+loop, app = shell_launch("--mode", "here", z)
+check("Extract Here (shell): compact window", app is not None and app.compact)
+check("...created hidden", app.root.withdraw.called)
+closed = loop.run(limit=15)
+check("...extracts and closes by itself", closed)
+check("...into a folder named after the archive", sorted(os.listdir(os.path.join(d, "fast"))) == ["a.txt", "sub"])
+check("...without ever showing a window for a fast job", not app.root.deiconify.called)
+check("...in well under a second (%.0f ms)" % ((loop.destroyed_at - loop.t0) * 1000),
+      loop.destroyed and loop.destroyed_at - loop.t0 < 1.0)
+check("...and with no popups", not messagebox.showinfo.called and not messagebox.showerror.called)
+
+# a job that takes a while reveals the small progress window, then still closes by itself
+def slow_extract(source, dest, ctx, motw_source=None):
+    for pct in (10, 40, 70, 100):
+        time.sleep(0.25)
+        ctx.progress(pct, pct, 100)
+    os.makedirs(dest, exist_ok=True)
+
+
+with mock.patch.object(sp, "extract_archive", slow_extract):
+    loop, app = shell_launch("--mode", "here", z)
+    closed = loop.run(limit=15)
+check("slow Extract Here: the progress window appears (after ~0.45 s)", app.root.deiconify.called)
+check("...and the window still closes by itself", closed)
+
+# failure: the window is shown so the error can be read, then it closes
+bad = os.path.join(d, "broken.zip")
+open(bad, "wb").write(b"this is not a zip file" * 50)
+loop, app = shell_launch("--mode", "here", bad)
+closed = loop.run(limit=15)
+check("broken archive: the window is revealed", app.root.deiconify.called)
+check("...an error is shown", messagebox.showerror.called)
+check("...and the small window closes afterwards (no confirmation screen)", closed)
+
+# with the setting off, Extract Here brings back the normal confirmation window
+open(sp.settings_path(), "w").write('{"quick_here": false}')
+loop, app = shell_launch("--mode", "here", z)
+check("quick off: normal-size, visible window", app is not None and not app.compact and not app.root.withdraw.called)
+check("...showing the confirmation screen", app.state == "choice")
+os.remove(sp.settings_path())
+
+# Add to ZIP from Explorer uses the compact window too
+folder2 = os.path.join(d, "proj2")
+os.makedirs(folder2)
+open(os.path.join(folder2, "f.txt"), "w").write("data" * 1000)
+loop, app = shell_launch("--mode", "compress-quick", folder2)
+check("Add to ZIP (shell): compact window", app.compact and app.root.withdraw.called)
+check("...completes, closes, and creates the zip", loop.run(limit=15) and os.path.isfile(os.path.join(d, "proj2.zip")))
+check("...never showing a window for a fast job", not app.root.deiconify.called)
 
 tempfile.tempdir = None
 shutil.rmtree(WORK, ignore_errors=True)
