@@ -36,7 +36,7 @@ filedialog = module("tkinter.filedialog", askopenfilenames=mock.MagicMock(), ask
 ttk = module("tkinter.ttk", Style=widget, Button=widget, Checkbutton=widget, Combobox=widget,
              Progressbar=widget, Treeview=widget, Scrollbar=widget)
 tk = module("tkinter", StringVar=StringVar, BooleanVar=BooleanVar, DoubleVar=DoubleVar, TclError=TclError,
-            Tk=widget, Frame=widget, Label=widget, Canvas=widget, Entry=widget, Toplevel=widget,
+            Tk=widget, Frame=widget, Label=widget, Canvas=widget, Entry=widget, Toplevel=widget, PhotoImage=widget,
             ttk=ttk, messagebox=messagebox, simpledialog=simpledialog, filedialog=filedialog)
 sys.modules.update({"tkinter": tk, "tkinter.ttk": ttk, "tkinter.messagebox": messagebox,
                     "tkinter.simpledialog": simpledialog, "tkinter.filedialog": filedialog})
@@ -129,8 +129,8 @@ check("Settings opens from home", app.state == "settings")
 app.set_quick_var.set(False); app.set_delete_var.set(True); app.set_sound_var.set(False)
 app.set_overwrite_var.set(dict(sp.OVERWRITE_POLICIES)["newer"]); app._settings_changed()
 saved = sp.load_settings()
-check("changes are saved to disk at once", saved == {"quick_here": False, "delete_after": True,
-                                                       "overwrite": "newer", "sound": False})
+check("changes are saved to disk at once", saved == dict(
+    sp.SETTINGS_DEFAULTS, quick_here=False, delete_after=True, overwrite="newer", sound=False))
 app.close_settings()
 check("Done returns home", app.state == "home")
 app.settings = sp.load_settings()
@@ -358,6 +358,102 @@ txt = messagebox.showerror.call_args[0][1] if messagebox.showerror.called else "
 check("UI: a corrupted entry is named, with a CRC explanation", "one.bin" in txt and "CRC" in txt)
 check("UI: ...and the app stays usable", app.state == "choice")
 _tempfile.tempdir = None
+
+
+# ---- redesigned home: no in-app "menu installed" row any more ----
+app, root = new_app()
+check("the 'Right-click menu installed' row and its Remove button are gone",
+      not any(hasattr(app, n) for n in ("menu_row", "lbl_menu", "btn_menu", "toggle_menu", "refresh_menu_status")))
+check("the context-menu registration itself is still there",
+      callable(sp.install_menu) and callable(sp.uninstall_menu))
+
+# ---- first-run tour ----
+app, root = new_app()
+check("tour: shown on first run", app.tour_active is True)
+app.tour_next(); app.tour_next()
+check("tour: the 3rd step is reached after two clicks", app.tour_step == 2 and app.tour_active)
+app.tour_next()
+check("tour: the third click finishes it", not app.tour_active and sp.load_settings()["tutorial_done"] is True)
+app, root = new_app()
+check("tour: not shown again on the next launch", app.tour_active is False)
+sp.save_settings(dict(sp.SETTINGS_DEFAULTS))
+app, root = new_app()
+app.tour_finish()
+check("tour: skipping also remembers it", sp.load_settings()["tutorial_done"] is True and not app.tour_active)
+app.open_settings(); app.tour_restart()
+check("tour: 'show again' in Settings brings it back", app.tour_active is True and app.state == "home")
+app, root = new_app(from_shell=True)
+check("tour: never shown for right-click actions", app.tour_active is False)
+sp.save_settings(dict(sp.SETTINGS_DEFAULTS, tutorial_done=True))
+
+# ---- Extract & Free Space (UI flow) ----
+app, root = new_app()
+d = fresh("free1"); z = os.path.join(d, "f.zip"); make_zip(z, {"a.txt": "A", "b/c.txt": "C"})
+app.open_archives([z], "dialog")
+messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
+app.begin_free()
+check("free: declining the warning does nothing - archive kept, nothing extracted, still on the options screen",
+      os.path.exists(z) and not os.path.exists(os.path.join(d, "f")) and app.state == "choice")
+check("free: the warning says the deletion is permanent",
+      "PERMANENTLY DELETE" in messagebox.askyesno.call_args[0][1] and "Recycle Bin" in messagebox.askyesno.call_args[0][1])
+messagebox.askyesno.return_value = True
+app.begin_free(); pump(app, {"finished"})
+check("free: after confirming, everything is extracted and then the archive is deleted",
+      not os.path.exists(z) and os.path.isfile(os.path.join(d, "a.txt"))
+      and os.path.isfile(os.path.join(d, "b", "c.txt")))
+
+d = fresh("free2"); z = os.path.join(d, "g.zip"); make_zip(z, {"a.txt": "A"})
+app.go_home(); app.open_archives([z], "dialog"); app.selection = {"a.txt"}
+messagebox.showinfo.reset_mock()
+app.begin_free()
+check("free: with a selection/filter it refuses and explains", messagebox.showinfo.called and os.path.exists(z)
+      and app.state == "choice")
+app.selection = None
+app.include_var.set("*.txt")
+messagebox.showinfo.reset_mock(); app.begin_free()
+check("free: a filter refuses too", messagebox.showinfo.called and os.path.exists(z))
+app.include_var.set("")
+
+# right-click mode: Open with ShredPack > Extract & Free Space
+d = fresh("free3"); z = os.path.join(d, "h.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
+app.open_archives([z], "free")
+check("free (right-click): always asks first; 'No' leaves everything untouched and closes",
+      messagebox.askyesno.called and os.path.exists(z) and not os.path.exists(os.path.join(d, "h")) and root.destroy.called)
+app, root = new_app(from_shell=True)
+messagebox.askyesno.return_value = True
+app.open_archives([z], "free"); pump(app, {"finished"})
+check("free (right-click): extracts into a folder named after the archive, then deletes the archive",
+      not os.path.exists(z) and os.listdir(os.path.join(d, "h")) == ["a.txt"])
+
+# a failure must never delete: corrupt archive
+d = fresh("free4"); z = os.path.join(d, "bad.zip"); make_zip(z, {"a.txt": "A" * 5000})
+raw = bytearray(open(z, "rb").read()); raw[60] ^= 0xFF; open(z, "wb").write(bytes(raw))
+app, root = new_app(from_shell=True)
+messagebox.askyesno.return_value = True
+app.open_archives([z], "free"); pump(app, {"finished"})
+check("free: a corrupt archive fails and is NOT deleted", os.path.exists(z))
+
+# deletion failing keeps the extracted files and tells the user
+d = fresh("free5"); z = os.path.join(d, "k.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+messagebox.showwarning.reset_mock()
+with mock.patch.object(sp, "delete_permanently", return_value="it is read-only or in use by another program"):
+    app.open_archives([z], "free"); pump(app, {"finished"})
+check("free: if the archive can't be deleted the files stay and the user is told why",
+      os.path.exists(z) and os.path.isfile(os.path.join(d, "k", "a.txt"))
+      and messagebox.showwarning.called and "couldn't be deleted" in messagebox.showwarning.call_args[0][1])
+
+# ordinary extraction never deletes (setting off)
+d = fresh("plain"); z = os.path.join(d, "p.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+app.open_archives([z], "here"); pump(app, {"finished"})
+check("normal Extract Here never deletes the archive", os.path.exists(z))
+
+# right-click menu constants / mode wiring
+check("Extract & Free Space is reachable from the context menu",
+      any(mode == "free" for _n, _l, mode in sp.ARCHIVE_SUBMENU_ITEMS))
 
 print("\nUI SMOKE RESULT: %d/%d" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)
