@@ -455,5 +455,79 @@ check("normal Extract Here never deletes the archive", os.path.exists(z))
 check("Extract & Free Space is reachable from the context menu",
       any(mode == "free" for _n, _l, mode in sp.ARCHIVE_SUBMENU_ITEMS))
 
+
+# ---- window lifecycle & the No / Cancel paths (the "application has been destroyed" bug) ----
+def shell_launch(archives, mode, answer):
+    """Start the app exactly as a right-click does: the constructor itself may ask a question
+    and close the window. Returns (app, root)."""
+    root = mock.MagicMock()
+    root.winfo_fpixels.return_value = 96.0
+    root.winfo_screenwidth.return_value = 1920
+    root.winfo_screenheight.return_value = 1080
+    messagebox.askyesno.reset_mock(); messagebox.showerror.reset_mock()
+    messagebox.askyesno.return_value = answer
+    return sp.ShredPackApp(root, archives, mode, from_shell=True), root
+
+def calls_after_destroy(root):
+    names = [c[0] for c in root.mock_calls]
+    return names[names.index("destroy") + 1:] if "destroy" in names else None
+
+for label, answer in (("No", False), ("closing the dialog / Cancel", False)):
+    d = fresh("life_" + label[:2]); z = os.path.join(d, "q.zip"); make_zip(z, {"a.txt": "A"})
+    app, root = shell_launch([z], "free", answer)
+    check("lifecycle (%s): declining Extract & Free Space ends normally - no error popup" % label,
+          not messagebox.showerror.called and messagebox.askyesno.called)
+    check("lifecycle (%s): archive kept, nothing extracted" % label,
+          os.path.exists(z) and not os.path.exists(os.path.join(d, "q")))
+    check("lifecycle (%s): the window is closed exactly once and the app reports it is no longer alive" % label,
+          root.destroy.call_count == 1 and app.alive is False)
+    check("lifecycle (%s): no Tk command (wm attributes, after, lift...) runs after destroy" % label,
+          calls_after_destroy(root) == [])
+
+# window attributes are configured while the window is alive, before the action starts
+d = fresh("life_order"); z = os.path.join(d, "o.zip"); make_zip(z, {"a.txt": "A"})
+app, root = shell_launch([z], "free", False)
+names = [c[0] for c in root.mock_calls]
+check("lifecycle: topmost/attributes are applied before the confirmation question can close the window",
+      "attributes" in names and names.index("attributes") < names.index("destroy"))
+
+# late callbacks and repeated close requests are harmless
+app._destroy(); app._destroy(); app._close_soon(5); app.go_home(); app._reveal(); app.on_close()
+check("lifecycle: repeated close requests destroy the window once",
+      root.destroy.call_count == 1)
+before_n = len(root.mock_calls)
+check("lifecycle: a timer scheduled after destroy is refused (no root.after on a dead window)",
+      app._after(10, lambda: None) is None and len(root.mock_calls) == before_n)
+app._on_update_result("9.9.9")
+check("lifecycle: a late update-check result does not touch the destroyed window",
+      len(root.mock_calls) == before_n)
+
+# pending timers are cancelled when the window goes away
+app, root = new_app(from_shell=True)
+root.after.side_effect = ["job1", "job2"]
+app._after(100, lambda: None); app._after(200, lambda: None)
+app._destroy()
+cancelled = [c.args[0] for c in root.after_cancel.call_args_list]
+check("lifecycle: pending after() jobs are cancelled on destroy", {"job1", "job2"} <= set(cancelled))
+
+# the in-app (not right-click) window: No simply returns to the options screen
+d = fresh("life_inapp"); z = os.path.join(d, "i.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=False)
+app.open_archives([z], "dialog")
+messagebox.askyesno.return_value = False; messagebox.showerror.reset_mock()
+app.begin_free()
+check("lifecycle: declining inside the app keeps the window open on the options screen",
+      app.alive and root.destroy.call_count == 0 and app.state == "choice"
+      and not messagebox.showerror.called and os.path.exists(z))
+
+# the destination label follows the selected archive
+check("dynamic label: shown on the options screen for 'Extract to <name>'",
+      sp.extract_to_label(os.path.join(d, "My Documents.zip")) == "Extract to My Documents\\")
+
+# no short blue accent line under the header
+import inspect
+src = inspect.getsource(sp.ShredPackApp._build_ui)
+check("header: the short blue accent line is gone", "ACCENT, width" not in src)
+
 print("\nUI SMOKE RESULT: %d/%d" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)

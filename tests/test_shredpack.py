@@ -921,6 +921,70 @@ if sp.py7zr:
           c7.files == 1 and len(out7["placed"]) == 1)
 else:
     skip("7z file-count test (py7zr isn't installed here)")
+
+# ---- Extract & Free Space: the deletion order and the extra size verification ----
+check("free space: the label names the archive without its extension (spaces, Unicode, .tar.gz)",
+      [sp.extract_to_label(os.path.join("C:\\x", n)) for n in
+       ("ShredPack.zip", "My Documents.zip", "Game Files.7z", "Backup.tar.gz", "Z\u00fcrich \u2013 \u65e5\u672c.tgz", "A.TAR.GZ", "rel.tar.xz")]
+      == ["Extract to ShredPack\\", "Extract to My Documents\\", "Extract to Game Files\\",
+          "Extract to Backup\\", "Extract to Z\u00fcrich \u2013 \u65e5\u672c\\", "Extract to A\\", "Extract to rel\\"])
+
+def free_case_sizes(name, members, wrong=False):
+    folder = os.path.join(FS, name); os.makedirs(folder)
+    arc = os.path.join(folder, "pack.zip")
+    with zipfile.ZipFile(arc, "w", zipfile.ZIP_STORED) as zf:
+        for n, d in members.items(): zf.writestr(n, d)
+    expected = sp.declared_file_sizes(arc)
+    if wrong: expected = expected[:-1] + [expected[-1] + 1]
+    before = [sp.file_signature(arc)]
+    ctx = sp.Ctx(threading.Event(), lambda *a: None)
+    outcome = sp.extract_archive(arc, os.path.join(folder, "pack"), ctx)
+    return arc, sp.free_space_after_extraction([arc], before, ctx, outcome, False, expected)
+
+arc, res = free_case_sizes("sz_ok", {"a.txt": "A" * 10, "b/c.txt": "C" * 3})
+check("free space: sizes on disk equal the archive's listing -> archive deleted", "freed" in res and not os.path.exists(arc))
+arc, res = free_case_sizes("sz_bad", {"a.txt": "A" * 10, "b/c.txt": "C" * 3}, wrong=True)
+check("free space: a size that disagrees with the archive's listing keeps the archive",
+      "kept" in res and "size" in res["kept"] and os.path.exists(arc))
+
+# deletion happens only after every check has passed, and never on a failed or cancelled run
+calls = []
+real_delete = sp.delete_permanently
+sp.delete_permanently = lambda path: calls.append(path)
+try:
+    arc, res, dest = free_case("order_ok", {"a.txt": "A"})
+    ok_calls = list(calls); del calls[:]
+    free_case("order_part", {"a.txt": "A"}, filtered=True)
+    free_case("order_changed", {"a.txt": "A"}, tamper=lambda a: open(a, "ab").write(b"x"))
+    free_case_sizes("order_size", {"a.txt": "AA"}, wrong=True)
+finally:
+    sp.delete_permanently = real_delete
+check("free space: delete is called once for a verified extraction and never when a check fails",
+      len(ok_calls) == 1 and calls == [])
+
+# a failed extraction (damaged archive) raises before any deletion logic: the archive survives
+bad = os.path.join(FS, "badzip.zip")
+with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as zf: zf.writestr("a.txt", "A" * 5000)
+raw = bytearray(open(bad, "rb").read()); raw[40:60] = b"\xff" * 20; open(bad, "wb").write(bytes(raw))
+failed = False
+try:
+    cx = sp.Ctx(threading.Event(), lambda *a: None)
+    sp.extract_archive(bad, os.path.join(FS, "badout"), cx)
+except Exception:
+    failed = True
+check("free space: a damaged archive fails to extract, so the deletion step is never reached, and the file remains",
+      failed and os.path.exists(bad))
+
+# a cancelled run leaves the archive and raises Cancelled before verification
+cancel_ev = threading.Event(); cancel_ev.set()
+okc = os.path.join(FS, "cancelme.zip")
+with zipfile.ZipFile(okc, "w", zipfile.ZIP_STORED) as zf: zf.writestr("a.txt", "A" * 5000)
+try:
+    sp.extract_archive(okc, os.path.join(FS, "cancelout"), sp.Ctx(cancel_ev, lambda *a: None)); cancelled = False
+except sp.Cancelled:
+    cancelled = True
+check("free space: a cancelled extraction raises Cancelled and the archive stays", cancelled and os.path.exists(okc))
+
 shutil.rmtree(FS, ignore_errors=True)
 
 tempfile.tempdir = None
