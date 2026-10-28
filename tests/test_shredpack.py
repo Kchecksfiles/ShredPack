@@ -7,6 +7,7 @@ What it cannot check is how Explorer itself renders the menus; see the notes in 
 Standard library only. Run:  python tests/test_menu_and_zip.py
 """
 import os, tarfile, io
+from unittest import mock
 import re
 import shutil
 import struct
@@ -305,6 +306,58 @@ check("state is stale if the icon setting differs", sp.install_state() == "stale
 sp.install_menu()
 check("reinstall fixes it", sp.install_state() == "current")
 sp.uninstall_menu()
+
+# ---- dynamic "Extract to <archive file name>" through the native shell extension (installer only) ----
+DLL = "C:\\Program Files\\ShredPack\\ShredPackMenu.dll"
+rd = FakeRegistry(); sp.set_registry(rd); seed_unrelated(rd); base_unrelated = unrelated_snapshot(rd)
+sp.install_menu()
+check("no DLL beside the exe (portable / source): the static 'Extract to' verb and no COM class",
+      rd.get_value(sp.ext_verb_key(".zip", "ShredPack3Folder"), "MUIVerb") == "Extract to <archive name>\\"
+      and not rd.key_exists(sp.clsid_key()))
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    check("a newly available DLL makes the existing static install 'stale'", sp.install_state() == "stale")
+    sp.install_menu()
+    check("with the DLL: install state is current", sp.install_state() == "current")
+    check("with the DLL: the COM class points at the DLL (apartment threaded)",
+          rd.get_value(sp.clsid_key() + "\\InprocServer32", "") == DLL
+          and rd.get_value(sp.clsid_key() + "\\InprocServer32", "ThreadingModel") == "Apartment")
+    handler_ok = all(
+        rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), "ExplorerCommandHandler") == sp.MENU_CLSID
+        and rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), "MUIVerb") is None
+        and not rd.key_exists(sp.ext_verb_key(e, "ShredPack3Folder") + "\\command")
+        and rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), sp.OWNER_VALUE) == sp.APP_NAME
+        for e in sp.registry_extensions())
+    check("with the DLL: 'Extract to' is served by the handler on every archive type (no fixed label, no command)", handler_ok)
+    check("with the DLL: the other items are unchanged (still plain verbs with their commands)",
+          rd.get_value(sp.ext_verb_key(".zip", "ShredPack1Extract"), "MUIVerb") == "Extract files..."
+          and "--mode here" in rd.get_value(sp.ext_verb_key(".zip", "ShredPack2Here") + "\\command", "")
+          and labels_of(effective_entries(rd, ".txt")) == COMPRESS_LABELS)
+    _cpp = open(os.path.join(os.path.dirname(os.path.abspath(sp.__file__)), "shell-ext", "ShredPackMenu.cpp"), encoding="utf-8").read()
+    _m = re.search(r"CLSID_ShredPackExtractTo\s*=\s*\{(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*\{([^}]*)\}\}", _cpp)
+    _b = [int(x, 16) for x in _m.group(4).split(",")]
+    _guid = "{%08X-%04X-%04X-%02X%02X-%s}" % (int(_m.group(1), 16), int(_m.group(2), 16), int(_m.group(3), 16),
+                                           _b[0], _b[1], "".join("%02X" % x for x in _b[2:]))
+    check("the handler CLSID in Python matches the one compiled into the DLL (%s)" % _guid, _guid == sp.MENU_CLSID.upper())
+sp.install_menu()    # DLL gone again (module patch ended): back to the static label
+check("DLL no longer there -> reinstall falls back to the static label and removes the COM class",
+      rd.get_value(sp.ext_verb_key(".zip", "ShredPack3Folder"), "MUIVerb") == "Extract to <archive name>\\"
+      and not rd.key_exists(sp.clsid_key()) and sp.install_state() == "current")
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    sp.install_menu()
+with mock.patch.object(sp, "menu_dll_path", return_value="D:\\Moved\\ShredPackMenu.dll"):
+    check("DLL moved to another folder -> the install is stale (so the start-up prompt offers an update)",
+          sp.install_state() == "stale")
+sp.uninstall_menu()
+check("uninstall removes the verbs and the COM class and leaves unrelated keys alone",
+      not rd.key_exists(sp.clsid_key()) and not rd.key_exists(sp.ext_verb_key(".zip", "ShredPack3Folder"))
+      and unrelated_snapshot(rd) == base_unrelated)
+rf = FakeRegistry(); sp.set_registry(rf)
+rf.set_values(sp.clsid_key(), {"": "Somebody else's class"})
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    warn = sp.install_menu(); sp.uninstall_menu()
+check("a CLSID key that is not ours is never overwritten or removed",
+      rf.get_value(sp.clsid_key(), "") == "Somebody else's class" and any("belongs to another" in w for w in warn))
+sp.set_registry(reg)
 
 # ---- migration from every earlier layout ----
 for name, seeder in (("v1.1.0 (two cascades)", seed_v110), ("v1.0.x (cascade + folder item)", seed_v10x),
@@ -1001,6 +1054,22 @@ check("extraction speed: ShredPack %.2fs vs stdlib extractall %.2fs (must stay w
       t_sp < max(2.0 * t_std, 0.3))
 check("extraction speed: output identical to the stdlib's",
       sp._list_all_files(os.path.join(FS, "sp_out")).__len__() == 300)
+
+# ---- "Extract to <name>\\": the name (label AND destination folder) follows the archive ----
+_names = {"GTA V.zip": "GTA V", "My Files.7z": "My Files", "Backup.tar.gz": "Backup", "Backup.TAR.GZ": "Backup",
+          "a.b.zip": "a.b", "GTA V.zip.001": "GTA V", "Big.7z.002": "Big", "Game.part1.rar": "Game",
+          "Game.part01.rar": "Game", "Game.z01": "Game", "Z\u00fcrich \u65e5\u672c.zip": "Z\u00fcrich \u65e5\u672c",
+          "Data.tbz2": "Data", "a (1).zip": "a (1)", "x.txt.gz": "x.txt"}
+check("extract-to name: extensions removed correctly (zip, 7z, tar.gz, split .zip.001, .part1.rar, Unicode)",
+      all(sp.archive_stem(os.path.join("C:\\x", n)) == v for n, v in _names.items()))
+_dd = fresh("etname")
+_arc = os.path.join(_dd, "GTA V.zip.001")
+check("extract-to name: the destination folder uses the same name as the label",
+      sp.compute_dest(_arc, "folder", None, False) == os.path.join(_dd, "GTA V")
+      and sp.extract_to_label(_arc) == "Extract to GTA V\\")
+os.makedirs(os.path.join(_dd, "GTA V")); os.makedirs(os.path.join(_dd, "GTA V (2)"))
+check("extract-to name: existing folders are never reused - the next free number is taken",
+      sp.compute_dest(_arc, "folder", None, False) == os.path.join(_dd, "GTA V (3)"))
 shutil.rmtree(FS, ignore_errors=True)
 
 tempfile.tempdir = None
