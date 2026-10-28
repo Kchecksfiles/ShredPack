@@ -1,10 +1,12 @@
 ; ShredPack installer script for Inno Setup (https://jrsoftware.org/isinfo.php)
 ;
 ; Build order (e.g. in your GitHub Action):
-;   1. pyinstaller --noconsole --onefile --collect-all py7zr --collect-all pycdlib
-;        --collect-all tkinterdnd2 --name ShredPack shredpack.py
-;      -> produces dist\ShredPack.exe
-;   2. "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+;   1. pyinstaller --noconsole --onedir --distpath dist-app --workpath build-app
+;        --icon=shredpack.ico --add-data "shredpack.ico;." --collect-all py7zr --collect-all pycdlib
+;        --collect-all pyzipper --collect-all tkinterdnd2 --name ShredPack shredpack.py
+;      -> produces the folder dist-app\ShredPack\ (ShredPack.exe + _internal\)
+;      A folder build opens faster than --onefile, which unpacks itself into %TEMP% on every start.
+;   2. "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=x.y.z setup.iss
 ;      -> produces Output\ShredPack-Setup.exe
 ;
 ; This script does NOT register the right-click menu itself. It calls
@@ -50,7 +52,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Name: "contextmenu"; Description: "Add ""Extract with ShredPack"" to the right-click menu"; GroupDescription: "Windows integration:"; Flags: checkedonce
 
 [Files]
-Source: "dist\ShredPack.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist-app\ShredPack\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
