@@ -36,7 +36,7 @@ filedialog = module("tkinter.filedialog", askopenfilenames=mock.MagicMock(), ask
 ttk = module("tkinter.ttk", Style=widget, Button=widget, Checkbutton=widget, Combobox=widget,
              Progressbar=widget, Treeview=widget, Scrollbar=widget)
 tk = module("tkinter", StringVar=StringVar, BooleanVar=BooleanVar, DoubleVar=DoubleVar, TclError=TclError,
-            Tk=widget, Frame=widget, Label=widget, Canvas=widget, Entry=widget, Toplevel=widget,
+            Tk=widget, Frame=widget, Label=widget, Canvas=widget, Entry=widget, Toplevel=widget, PhotoImage=widget,
             ttk=ttk, messagebox=messagebox, simpledialog=simpledialog, filedialog=filedialog)
 sys.modules.update({"tkinter": tk, "tkinter.ttk": ttk, "tkinter.messagebox": messagebox,
                     "tkinter.simpledialog": simpledialog, "tkinter.filedialog": filedialog})
@@ -116,7 +116,7 @@ app.settings.update(delete_after=False, overwrite="rename")
 d = fresh("quickwarn"); z = os.path.join(d, "w.zip"); make_zip(z, {"a.txt": "A"})
 messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
 with mock.patch.object(sp, "preflight_risk", return_value="Test warning: looks risky"):
-    app.go_home(); app.open_archives([z], "here")
+    app.go_home(); app.open_archives([z], "here"); pump(app, {"finished"})
 check("declined warning: nothing extracted, back on the confirmation screen",
       app.state == "choice" and not os.path.exists(os.path.join(d, "w")))
 check("...and the warning was shown", messagebox.askyesno.called)
@@ -129,8 +129,8 @@ check("Settings opens from home", app.state == "settings")
 app.set_quick_var.set(False); app.set_delete_var.set(True); app.set_sound_var.set(False)
 app.set_overwrite_var.set(dict(sp.OVERWRITE_POLICIES)["newer"]); app._settings_changed()
 saved = sp.load_settings()
-check("changes are saved to disk at once", saved == {"quick_here": False, "delete_after": True,
-                                                       "overwrite": "newer", "sound": False})
+check("changes are saved to disk at once", saved == dict(
+    sp.SETTINGS_DEFAULTS, quick_here=False, delete_after=True, overwrite="newer", sound=False))
 app.close_settings()
 check("Done returns home", app.state == "home")
 app.settings = sp.load_settings()
@@ -165,14 +165,15 @@ check("play_sound is a silent no-op where winsound doesn't exist", sp.play_sound
 # Windows path, with a fake winsound: it must NOT combine SND_MEMORY with SND_ASYNC (that raises
 # RuntimeError on real Windows) - the in-memory WAV plays synchronously on a background thread.
 calls = []
-fake_ws = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, PlaySound=lambda data, flags: calls.append((data, flags)))
-with mock.patch.dict(sys.modules, {"winsound": fake_ws}), mock.patch.object(sp.sys, "platform", "win32"):
+fake_ws = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, SND_NODEFAULT=2, MB_OK=0, MessageBeep=lambda k: None,
+                                PlaySound=lambda data, flags: calls.append((data, flags)))
+with mock.patch.dict(sys.modules, {"winsound": fake_ws}), mock.patch.object(sp, "IS_WINDOWS", True):
     sp._sound_cache.clear()
     ms = sp.play_sound("done")
     deadline = time.time() + 5
     while not calls and time.time() < deadline: time.sleep(0.01)
 check("play_sound (Windows path) returns the chime length and plays from memory",
-      ms > 300 and len(calls) == 1 and calls[0][0][:4] == b"RIFF" and calls[0][1] == fake_ws.SND_MEMORY)
+      ms > 300 and len(calls) == 1 and calls[0][0][:4] == b"RIFF" and calls[0][1] == (fake_ws.SND_MEMORY | fake_ws.SND_NODEFAULT) and not calls[0][1] & fake_ws.SND_ASYNC)
 sp._sound_cache.clear()
 
 # ---- selection from browser + delete guard ----
@@ -358,6 +359,273 @@ txt = messagebox.showerror.call_args[0][1] if messagebox.showerror.called else "
 check("UI: a corrupted entry is named, with a CRC explanation", "one.bin" in txt and "CRC" in txt)
 check("UI: ...and the app stays usable", app.state == "choice")
 _tempfile.tempdir = None
+
+
+# ---- redesigned home: no in-app "menu installed" row any more ----
+app, root = new_app()
+check("the 'Right-click menu installed' row and its Remove button are gone",
+      not any(hasattr(app, n) for n in ("menu_row", "lbl_menu", "btn_menu", "toggle_menu", "refresh_menu_status")))
+check("the context-menu registration itself is still there",
+      callable(sp.install_menu) and callable(sp.uninstall_menu))
+
+# ---- first-run tour ----
+app, root = new_app()
+check("tour: shown on first run", app.tour_active is True)
+app.tour_next(); app.tour_next()
+check("tour: the 3rd step is reached after two clicks", app.tour_step == 2 and app.tour_active)
+app.tour_next()
+check("tour: the third click finishes it", not app.tour_active and sp.load_settings()["tutorial_done"] is True)
+app, root = new_app()
+check("tour: not shown again on the next launch", app.tour_active is False)
+sp.save_settings(dict(sp.SETTINGS_DEFAULTS))
+app, root = new_app()
+app.tour_finish()
+check("tour: skipping also remembers it", sp.load_settings()["tutorial_done"] is True and not app.tour_active)
+app.open_settings(); app.tour_restart()
+check("tour: 'show again' in Settings brings it back", app.tour_active is True and app.state == "home")
+app, root = new_app(from_shell=True)
+check("tour: never shown for right-click actions", app.tour_active is False)
+sp.save_settings(dict(sp.SETTINGS_DEFAULTS, tutorial_done=True))
+
+# ---- Extract & Free Space (UI flow) ----
+app, root = new_app()
+d = fresh("free1"); z = os.path.join(d, "f.zip"); make_zip(z, {"a.txt": "A", "b/c.txt": "C"})
+app.open_archives([z], "dialog")
+messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
+app.begin_free()
+check("free: declining the warning does nothing - archive kept, nothing extracted, still on the options screen",
+      os.path.exists(z) and not os.path.exists(os.path.join(d, "f")) and app.state == "choice")
+check("free: the warning says the deletion is permanent",
+      "PERMANENTLY DELETE" in messagebox.askyesno.call_args[0][1] and "Recycle Bin" in messagebox.askyesno.call_args[0][1])
+messagebox.askyesno.return_value = True
+app.begin_free(); pump(app, {"finished"})
+check("free: after confirming, everything is extracted and then the archive is deleted",
+      not os.path.exists(z) and os.path.isfile(os.path.join(d, "a.txt"))
+      and os.path.isfile(os.path.join(d, "b", "c.txt")))
+
+d = fresh("free2"); z = os.path.join(d, "g.zip"); make_zip(z, {"a.txt": "A"})
+app.go_home(); app.open_archives([z], "dialog"); app.selection = {"a.txt"}
+messagebox.showinfo.reset_mock()
+app.begin_free()
+check("free: with a selection/filter it refuses and explains", messagebox.showinfo.called and os.path.exists(z)
+      and app.state == "choice")
+app.selection = None
+app.include_var.set("*.txt")
+messagebox.showinfo.reset_mock(); app.begin_free()
+check("free: a filter refuses too", messagebox.showinfo.called and os.path.exists(z))
+app.include_var.set("")
+
+# right-click mode: Open with ShredPack > Extract & Free Space
+d = fresh("free3"); z = os.path.join(d, "h.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
+app.open_archives([z], "free")
+check("free (right-click): always asks first; 'No' leaves everything untouched and closes",
+      messagebox.askyesno.called and os.path.exists(z) and not os.path.exists(os.path.join(d, "h")) and root.destroy.called)
+app, root = new_app(from_shell=True)
+messagebox.askyesno.return_value = True
+app.open_archives([z], "free"); pump(app, {"finished"})
+check("free (right-click): extracts into a folder named after the archive, then deletes the archive",
+      not os.path.exists(z) and os.listdir(os.path.join(d, "h")) == ["a.txt"])
+
+# a failure must never delete: corrupt archive
+d = fresh("free4"); z = os.path.join(d, "bad.zip"); make_zip(z, {"a.txt": "A" * 5000})
+raw = bytearray(open(z, "rb").read()); raw[60] ^= 0xFF; open(z, "wb").write(bytes(raw))
+app, root = new_app(from_shell=True)
+messagebox.askyesno.return_value = True
+app.open_archives([z], "free"); pump(app, {"finished"})
+check("free: a corrupt archive fails and is NOT deleted", os.path.exists(z))
+
+# deletion failing keeps the extracted files and tells the user
+d = fresh("free5"); z = os.path.join(d, "k.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+messagebox.showwarning.reset_mock()
+with mock.patch.object(sp, "delete_permanently", return_value="it is read-only or in use by another program"):
+    app.open_archives([z], "free"); pump(app, {"finished"})
+check("free: if the archive can't be deleted the files stay and the user is told why",
+      os.path.exists(z) and os.path.isfile(os.path.join(d, "k", "a.txt"))
+      and messagebox.showwarning.called and "couldn't be deleted" in messagebox.showwarning.call_args[0][1])
+
+# ordinary extraction never deletes (setting off)
+d = fresh("plain"); z = os.path.join(d, "p.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=True)
+app.open_archives([z], "here"); pump(app, {"finished"})
+check("normal Extract Here never deletes the archive", os.path.exists(z))
+
+# right-click menu constants / mode wiring
+check("Extract & Free Space is reachable from the context menu",
+      any(mode == "free" for _n, _l, mode in sp.ARCHIVE_SUBMENU_ITEMS))
+
+
+# ---- window lifecycle & the No / Cancel paths (the "application has been destroyed" bug) ----
+def shell_launch(archives, mode, answer):
+    """Start the app exactly as a right-click does: the constructor itself may ask a question
+    and close the window. Returns (app, root)."""
+    root = mock.MagicMock()
+    root.winfo_fpixels.return_value = 96.0
+    root.winfo_screenwidth.return_value = 1920
+    root.winfo_screenheight.return_value = 1080
+    messagebox.askyesno.reset_mock(); messagebox.showerror.reset_mock()
+    messagebox.askyesno.return_value = answer
+    return sp.ShredPackApp(root, archives, mode, from_shell=True), root
+
+def calls_after_destroy(root):
+    names = [c[0] for c in root.mock_calls]
+    return names[names.index("destroy") + 1:] if "destroy" in names else None
+
+for label, answer in (("No", False), ("closing the dialog / Cancel", False)):
+    d = fresh("life_" + label[:2]); z = os.path.join(d, "q.zip"); make_zip(z, {"a.txt": "A"})
+    app, root = shell_launch([z], "free", answer)
+    check("lifecycle (%s): declining Extract & Free Space ends normally - no error popup" % label,
+          not messagebox.showerror.called and messagebox.askyesno.called)
+    check("lifecycle (%s): archive kept, nothing extracted" % label,
+          os.path.exists(z) and not os.path.exists(os.path.join(d, "q")))
+    check("lifecycle (%s): the window is closed exactly once and the app reports it is no longer alive" % label,
+          root.destroy.call_count == 1 and app.alive is False)
+    check("lifecycle (%s): no Tk command (wm attributes, after, lift...) runs after destroy" % label,
+          calls_after_destroy(root) == [])
+
+# window attributes are configured while the window is alive, before the action starts
+d = fresh("life_order"); z = os.path.join(d, "o.zip"); make_zip(z, {"a.txt": "A"})
+app, root = shell_launch([z], "free", False)
+names = [c[0] for c in root.mock_calls]
+check("lifecycle: topmost/attributes are applied before the confirmation question can close the window",
+      "attributes" in names and names.index("attributes") < names.index("destroy"))
+
+# late callbacks and repeated close requests are harmless
+app._destroy(); app._destroy(); app._close_soon(5); app.go_home(); app._reveal(); app.on_close()
+check("lifecycle: repeated close requests destroy the window once",
+      root.destroy.call_count == 1)
+before_n = len(root.mock_calls)
+check("lifecycle: a timer scheduled after destroy is refused (no root.after on a dead window)",
+      app._after(10, lambda: None) is None and len(root.mock_calls) == before_n)
+app._on_update_result("9.9.9")
+check("lifecycle: a late update-check result does not touch the destroyed window",
+      len(root.mock_calls) == before_n)
+
+# pending timers are cancelled when the window goes away
+app, root = new_app(from_shell=True)
+root.after.side_effect = ["job1", "job2"]
+app._after(100, lambda: None); app._after(200, lambda: None)
+app._destroy()
+cancelled = [c.args[0] for c in root.after_cancel.call_args_list]
+check("lifecycle: pending after() jobs are cancelled on destroy", {"job1", "job2"} <= set(cancelled))
+
+# the in-app (not right-click) window: No simply returns to the options screen
+d = fresh("life_inapp"); z = os.path.join(d, "i.zip"); make_zip(z, {"a.txt": "A"})
+app, root = new_app(from_shell=False)
+app.open_archives([z], "dialog")
+messagebox.askyesno.return_value = False; messagebox.showerror.reset_mock()
+app.begin_free()
+check("lifecycle: declining inside the app keeps the window open on the options screen",
+      app.alive and root.destroy.call_count == 0 and app.state == "choice"
+      and not messagebox.showerror.called and os.path.exists(z))
+
+# the destination label follows the selected archive
+check("dynamic label: shown on the options screen for 'Extract to <name>'",
+      sp.extract_to_label(os.path.join(d, "My Documents.zip")) == "Extract to My Documents\\")
+
+# no short blue accent line under the header
+import inspect
+src = inspect.getsource(sp.ShredPackApp._build_ui)
+check("header: the short blue accent line is gone", "ACCENT, width" not in src)
+
+# ---- "Extract to <archive name>\\": instant, correct folder, no popup; sound only on success ----
+def sound_session():
+    """Fake winsound: records every sound that would have been played (by kind)."""
+    played = []
+    done_wav, err_wav = sp._sound("done")[0], sp._sound("error")[0]
+    def play(data, flags):
+        played.append("done" if data == done_wav else "error" if data == err_wav else "other")
+    fake = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, SND_NODEFAULT=2, MB_OK=0,
+                                 MessageBeep=lambda k: played.append("beep"), PlaySound=play)
+    return played, fake
+
+def wait_sounds(played, n, timeout=3):
+    end = time.time() + timeout
+    while len(played) < n and time.time() < end: time.sleep(0.01)
+    time.sleep(0.05)
+
+shown = []
+d = fresh("etf"); z = os.path.join(d, "GTA V.zip"); make_zip(z, {"readme.txt": "hi", "data/a.bin": "A" * 100})
+played, fake = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake}), mock.patch.object(sp, "IS_WINDOWS", True):
+    sp.settings_path()                      # default settings: sound on
+    messagebox.askyesno.reset_mock(); messagebox.showwarning.reset_mock(); messagebox.showerror.reset_mock()
+    app, root = shell_launch([z], "folder", True)
+    orig_show = app.show; app.show = lambda v: (shown.append(v), orig_show(v))[1]
+    check("extract-to: starts extracting immediately (processing, no options screen)",
+          app.state == "processing" and app.view_choice not in shown)
+    pump(app, {"finished"}); wait_sounds(played, 1)
+check("extract-to: files land in a folder named after the archive ('GTA V'), archive untouched",
+      sorted(os.listdir(os.path.join(d, "GTA V"))) == ["data", "readme.txt"] and os.path.exists(z))
+check("extract-to: no confirmation popup, no warning, no error",
+      not messagebox.askyesno.called and not messagebox.showwarning.called and not messagebox.showerror.called)
+titles = [c.kwargs.get("text", "") for c in app.lbl_p_title.config.call_args_list]
+check("extract-to: the progress title names the real destination folder 'GTA V\\'",
+      any(t == "Extracting to GTA V\\" for t in titles))
+check("sound: exactly one 'done' chime after a successful extraction", played == ["done"])
+
+# a second run into the same place gets its own folder and the label follows ('GTA V (2)')
+played2, fake2 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake2}), mock.patch.object(sp, "IS_WINDOWS", True):
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"}); wait_sounds(played2, 1)
+check("extract-to: an existing folder is never mixed into - the new one is 'GTA V (2)'",
+      os.path.isdir(os.path.join(d, "GTA V (2)")) and sorted(os.listdir(os.path.join(d, "GTA V"))) == ["data", "readme.txt"])
+
+# the sound setting is honoured
+d = fresh("etf_mute"); z = os.path.join(d, "Quiet.zip"); make_zip(z, {"a.txt": "A"})
+played3, fake3 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake3}), mock.patch.object(sp, "IS_WINDOWS", True):
+    app, root = shell_launch([z], "folder", True); app.settings["sound"] = False
+    pump(app, {"finished"}); wait_sounds(played3, 1, 0.5)
+check("sound: nothing plays when the setting is off", played3 == [])
+
+# failure: error popup, error sound (never the success chime), archive intact, no half-made folder
+d = fresh("etf_bad"); z = os.path.join(d, "Broken.zip"); make_zip(z, {"a.txt": "A" * 8000})
+raw = bytearray(open(z, "rb").read()); raw[45:70] = b"\xff" * 25; open(z, "wb").write(bytes(raw)); size0 = os.path.getsize(z)
+played4, fake4 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake4}), mock.patch.object(sp, "IS_WINDOWS", True):
+    messagebox.showerror.reset_mock()
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"}); wait_sounds(played4, 1)
+check("extract-to (damaged archive): the error is shown, the archive is untouched, nothing is left behind",
+      messagebox.showerror.called and os.path.getsize(z) == size0 and not os.path.exists(os.path.join(d, "Broken")))
+check("sound: a failure plays the error sound, never the success chime", played4 == ["error"])
+
+# cancellation (declining the size warning): no sound, nothing extracted, archive intact
+d = fresh("etf_cancel"); z = os.path.join(d, "Big.zip"); make_zip(z, {"a.txt": "A"})
+played5, fake5 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake5}), mock.patch.object(sp, "IS_WINDOWS", True), \
+     mock.patch.object(sp, "preflight_risk", return_value="Test warning: looks risky"):
+    app, root = shell_launch([z], "folder", False)     # answer 'No' to the essential warning
+    pump(app, {"finished"}); wait_sounds(played5, 1, 0.5)
+check("cancel: the essential size warning is still asked, declining extracts nothing and plays no sound",
+      messagebox.askyesno.called and played5 == [] and os.path.exists(z) and not os.path.exists(os.path.join(d, "Big")))
+check("cancel: the window closes normally afterwards", root.destroy.call_count == 1 and app.alive is False)
+
+# a user cancel during extraction (Cancel button) also stays silent and keeps the archive
+d = fresh("etf_cancel2"); z = os.path.join(d, "C.zip"); make_zip(z, {"a.txt": "A" * 100000})
+played6, fake6 = sound_session()
+def cancelling_extract(path, dest, ctx, motw_source=None):
+    ctx.cancel.set()                                   # the user presses Cancel mid-extraction
+    ctx._check()                                       # -> raises Cancelled exactly as the engine does
+real_extract = sp.extract_archive
+with mock.patch.dict(sys.modules, {"winsound": fake6}), mock.patch.object(sp, "IS_WINDOWS", True), \
+     mock.patch.object(sp, "extract_archive", cancelling_extract):
+    app, root = new_app(from_shell=False); app.open_archives([z], "dialog")
+    app.begin(); pump(app, {"finished"}); wait_sounds(played6, 1, 0.5)
+check("cancel: pressing Cancel plays no sound and the archive remains", played6 == [] and os.path.exists(z))
+
+
+# the size / free-space pre-check no longer blocks the UI thread
+import threading as _th
+seen = []
+d = fresh("pf_thread"); z = os.path.join(d, "p.zip"); make_zip(z, {"a.txt": "A"})
+def spy(path, dest, fmt):
+    seen.append(_th.current_thread() is _th.main_thread()); return None
+with mock.patch.object(sp, "preflight_risk", spy):
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"})
+check("speed: the pre-extraction size check runs on the worker thread, not the UI thread", seen == [False])
 
 print("\nUI SMOKE RESULT: %d/%d" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)

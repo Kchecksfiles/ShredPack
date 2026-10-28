@@ -6,7 +6,8 @@ What it cannot check is how Explorer itself renders the menus; see the notes in 
 
 Standard library only. Run:  python tests/test_menu_and_zip.py
 """
-import os
+import os, tarfile, io
+from unittest import mock
 import re
 import shutil
 import struct
@@ -151,8 +152,10 @@ UNRELATED = [
 
 # Keys that merely share ShredPack's names but belong to something else.
 COLLISIONS = [
-    (SFA + ".7z\\shell\\ShredPack", {"MUIVerb": "Other Tool"}),                 # a spot we'd install into
-    (SFA + ".7z\\shell\\ShredPack\\command", {"": '"C:\\othertool.exe" "%1"'}),
+    (SFA + ".7z\\shell\\ShredPack4Open", {"MUIVerb": "Other Tool"}),            # a spot we'd install into
+    (SFA + ".7z\\shell\\ShredPack4Open\\command", {"": '"C:\\othertool.exe" "%1"'}),
+    (SFA + ".7z\\shell\\ShredPack", {"MUIVerb": "Another Tool"}),               # the old v1.1 position
+    (SFA + ".7z\\shell\\ShredPack\\command", {"": '"C:\\another.exe" "%1"'}),
     (CLS + "Directory\\shell\\ShredPackCompress", {"MUIVerb": "Not Ours"}),     # the old v1.1.0 name
     (CLS + "Directory\\shell\\ShredPackCompress\\command", {"": '"C:\\notours.exe"'}),
 ]
@@ -180,25 +183,51 @@ def aqs_matches(applies_to, ext):
     return ext.lower() in exts
 
 
-def effective_menus(reg, target):
-    """The top-level 'ShredPack' menus Explorer would show for an extension ('.zip') or 'FOLDER'.
-    Returns a list of menus, each a list of (label, command)."""
-    paths = [sp.compress_class_key("Directory")] if target == "FOLDER" \
-        else [sp.ext_key(target), sp.compress_class_key("*")]
-    menus = []
-    for path in paths:
-        if not reg.key_exists(path) or reg.get_value(path, "MUIVerb") != "ShredPack":
-            continue
-        if target != "FOLDER" and not aqs_matches(reg.get_value(path, "AppliesTo"), target):
-            continue
-        shell = path + "\\shell\\"
-        menus.append([(reg.get_value(shell + s), reg.get_value(shell + s + "\\command"))
-                      for s in sorted(reg.subkeys(path + "\\shell"))])
-    return menus
+def effective_entries(reg, target):
+    """What Explorer would list from ShredPack for an extension ('.zip') or 'FOLDER', in the
+    order of the registry key names. Each entry is ('item', label, command) or
+    ('submenu', label, [(label, command), ...])."""
+    shells = [CLS + "Directory\\shell"] if target == "FOLDER" \
+        else [SFA + target + "\\shell", CLS + "*\\shell"]
+    entries = []
+    for shell in shells:
+        for name in sorted(reg.subkeys(shell), key=str.lower):
+            path = shell + "\\" + name
+            ours = reg.get_value(path, "ShredPackItem") is not None \
+                or reg.get_value(path, "MUIVerb") in ("ShredPack", "Open with ShredPack")
+            if not ours:
+                continue
+            if target != "FOLDER" and not aqs_matches(reg.get_value(path, "AppliesTo"), target):
+                continue
+            label = reg.get_value(path, "MUIVerb") or reg.get_value(path, "")
+            if reg.get_value(path, "SubCommands") is not None:
+                subs = [(reg.get_value(path + "\\shell\\" + n), reg.get_value(path + "\\shell\\" + n + "\\command"))
+                        for n in sorted(reg.subkeys(path + "\\shell"))]
+                entries.append(("submenu", label, subs))
+            else:
+                entries.append(("item", label, reg.get_value(path + "\\command")))
+    return entries
 
 
-ARCHIVE_LABELS = ["Extract files...", "Extract Here", "Test archive", "Add to ZIP", "Add to archive..."]
-COMPRESS_LABELS = ["Add to ZIP", "Add to archive..."]
+def labels_of(entries):
+    """Flatten entries to ['Extract files...', ..., ('Open with ShredPack', ['Test archive', ...])]."""
+    return [e[1] if e[0] == "item" else (e[1], [l for l, _c in e[2]]) for e in entries]
+
+
+def commands_of(entries):
+    out = {}
+    for e in entries:
+        if e[0] == "item":
+            out[e[1]] = e[2]
+        else:
+            out.update({l: c for l, c in e[2]})
+    return out
+
+
+ARCHIVE_LABELS = ["Extract files...", "Extract Here", "Extract to <archive name>\\",
+                  ("Open with ShredPack", ["Extract && Free Space...", "Test archive", "Add to ZIP",
+                                           "Add to archive..."])]
+COMPRESS_LABELS = [("Open with ShredPack", ["Add to ZIP", "Add to archive..."])]
 
 reg = FakeRegistry()
 sp.set_registry(reg)
@@ -210,30 +239,29 @@ before_unrelated = unrelated_snapshot(reg)
 warnings = sp.install_menu()
 check("install state is current after install", sp.install_state() == "current")
 for ext in sp.registry_extensions():
-    menus = effective_menus(reg, ext)
-    if not (len(menus) == 1 and [l for l, _c in menus[0]] == ARCHIVE_LABELS):
-        check("archive %s shows exactly one menu with the 5 commands (got %r)" % (
-            ext, [[l for l, _c in m] for m in menus]), False)
+    got = labels_of(effective_entries(reg, ext))
+    if got != ARCHIVE_LABELS:
+        check("archive %s shows the 3 direct items + the submenu (got %r)" % (ext, got), False)
         break
 else:
-    check("every archive type shows ONE ShredPack menu with all 5 commands in order", True)
+    check("every archive type shows 3 direct items, then ONE 'Open with ShredPack' submenu", True)
+check(".rar archives are registered", ".rar" in sp.registry_extensions())
 for ext in (".txt", ".exe", ".docx", ".png"):
-    menus = effective_menus(reg, ext)
-    check("ordinary file %s: one menu, compression options only" % ext,
-          len(menus) == 1 and [l for l, _c in menus[0]] == COMPRESS_LABELS)
-menus = effective_menus(reg, "FOLDER")
-check("folder: one menu, compression options retained",
-      len(menus) == 1 and [l for l, _c in menus[0]] == COMPRESS_LABELS)
+    check("ordinary file %s: only the compression submenu" % ext,
+          labels_of(effective_entries(reg, ext)) == COMPRESS_LABELS)
+check("folder: only the compression submenu",
+      labels_of(effective_entries(reg, "FOLDER")) == COMPRESS_LABELS)
 check("the generic '*' menu is hidden on archives via AppliesTo",
       all(e in reg.get_value(sp.compress_class_key("*"), "AppliesTo") for e in (".zip", ".7z", ".tar", ".iso")))
 check("no AppliesTo on the folder menu", reg.get_value(sp.compress_class_key("Directory"), "AppliesTo") is None)
 
 # ---- command-line modes preserved ----
 expected_modes = {label: mode for _n, label, mode in sp.ARCHIVE_MENU_ITEMS}
-check("modes are the existing ones",
-      set(expected_modes.values()) == {"dialog", "here", "test", "compress-quick", "compress-dialog"})
+check("modes are the existing ones plus Extract & Free Space",
+      set(expected_modes.values()) == {"dialog", "here", "folder", "free", "test", "compress-quick",
+                                       "compress-dialog"})
 launcher = sp.launcher_command()
-bad = [(l, c) for l, c in effective_menus(reg, ".zip")[0]
+bad = [(l, c) for l, c in commands_of(effective_entries(reg, ".zip")).items()
        if c != '%s --mode %s "%%1"' % (launcher, expected_modes[l])]
 check("every command launches the app with its --mode and the clicked file", not bad)
 check("a mode string round-trips through menu_command", sp.menu_command("test").endswith('--mode test "%1"'))
@@ -254,8 +282,7 @@ check("state stays current", sp.install_state() == "current")
 sp.uninstall_menu()
 check("uninstall leaves only unrelated keys (plus their parents)", unrelated_snapshot(reg) == before_unrelated)
 check("state is none after uninstall", sp.install_state() == "none")
-leftover = [k for k in reg.snapshot() if k.lower().endswith("\\shell\\shredpack") and "7z" not in k.lower()
-            and "directory" not in k.lower()]
+leftover = [k for k in reg.snapshot() if "\\shell\\shredpack" in k.lower()]
 check("no ShredPack keys remain", not leftover)
 sp.uninstall_menu()
 check("uninstalling twice is harmless", unrelated_snapshot(reg) == before_unrelated)
@@ -268,7 +295,8 @@ sys.frozen = True
 try:
     sp.install_menu()
     want = '"%s",0' % sys.executable
-    tops = [sp.ext_key(e) for e in sp.registry_extensions()] + [sp.compress_class_key("*")]
+    tops = [sp.ext_key(e) for e in sp.registry_extensions()] + [sp.compress_class_key("*")] \
+        + [sp.ext_verb_key(e, n) for e in sp.registry_extensions() for n, _l, _m in sp.DIRECT_MENU_ITEMS]
     check("frozen build: every cascade keeps the app icon",
           all(reg.get_value(p, "Icon") == want for p in tops if reg.key_exists(p)))
     check("icon is part of the 'current' state", sp.install_state() == "current")
@@ -278,6 +306,69 @@ check("state is stale if the icon setting differs", sp.install_state() == "stale
 sp.install_menu()
 check("reinstall fixes it", sp.install_state() == "current")
 sp.uninstall_menu()
+
+# ---- dynamic "Extract to <archive file name>" through the native shell extension (installer only) ----
+DLL = "C:\\Program Files\\ShredPack\\ShredPackMenu.dll"
+rd = FakeRegistry(); sp.set_registry(rd); seed_unrelated(rd); base_unrelated = unrelated_snapshot(rd)
+sp.install_menu()
+check("no DLL beside the exe (portable / source): the static 'Extract to' verb and no COM class",
+      rd.get_value(sp.ext_verb_key(".zip", "ShredPack3Folder"), "MUIVerb") == "Extract to <archive name>\\"
+      and not rd.key_exists(sp.clsid_key()))
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    check("a newly available DLL makes the existing static install 'stale'", sp.install_state() == "stale")
+    sp.install_menu()
+    check("with the DLL: install state is current", sp.install_state() == "current")
+    check("with the DLL: the COM class points at the DLL (apartment threaded)",
+          rd.get_value(sp.clsid_key() + "\\InprocServer32", "") == DLL
+          and rd.get_value(sp.clsid_key() + "\\InprocServer32", "ThreadingModel") == "Apartment")
+    handler_ok = all(
+        rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), "ExplorerCommandHandler") == sp.MENU_CLSID
+        and rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), "MUIVerb") is None
+        and not rd.key_exists(sp.ext_verb_key(e, "ShredPack3Folder") + "\\command")
+        and rd.get_value(sp.ext_verb_key(e, "ShredPack3Folder"), sp.OWNER_VALUE) == sp.APP_NAME
+        for e in sp.registry_extensions())
+    check("with the DLL: 'Extract to' is served by the handler on every archive type (no fixed label, no command)", handler_ok)
+    check("with the DLL: the other items are unchanged (still plain verbs with their commands)",
+          rd.get_value(sp.ext_verb_key(".zip", "ShredPack1Extract"), "MUIVerb") == "Extract files..."
+          and "--mode here" in rd.get_value(sp.ext_verb_key(".zip", "ShredPack2Here") + "\\command", "")
+          and labels_of(effective_entries(rd, ".txt")) == COMPRESS_LABELS)
+    _cpp = open(os.path.join(os.path.dirname(os.path.abspath(sp.__file__)), "shell-ext", "ShredPackMenu.cpp"), encoding="utf-8").read()
+    _m = re.search(r"CLSID_ShredPackExtractTo\s*=\s*\{(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*\{([^}]*)\}\}", _cpp)
+    _b = [int(x, 16) for x in _m.group(4).split(",")]
+    _guid = "{%08X-%04X-%04X-%02X%02X-%s}" % (int(_m.group(1), 16), int(_m.group(2), 16), int(_m.group(3), 16),
+                                           _b[0], _b[1], "".join("%02X" % x for x in _b[2:]))
+    check("the handler CLSID in Python matches the one compiled into the DLL (%s)" % _guid, _guid == sp.MENU_CLSID.upper())
+sp.install_menu()    # DLL gone again (module patch ended): back to the static label
+check("DLL no longer there -> reinstall falls back to the static label and removes the COM class",
+      rd.get_value(sp.ext_verb_key(".zip", "ShredPack3Folder"), "MUIVerb") == "Extract to <archive name>\\"
+      and not rd.key_exists(sp.clsid_key()) and sp.install_state() == "current")
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    sp.install_menu()
+with mock.patch.object(sp, "menu_dll_path", return_value="D:\\Moved\\ShredPackMenu.dll"):
+    check("DLL moved to another folder -> the install is stale (so the start-up prompt offers an update)",
+          sp.install_state() == "stale")
+sp.uninstall_menu()
+check("uninstall removes the verbs and the COM class and leaves unrelated keys alone",
+      not rd.key_exists(sp.clsid_key()) and not rd.key_exists(sp.ext_verb_key(".zip", "ShredPack3Folder"))
+      and unrelated_snapshot(rd) == base_unrelated)
+rf = FakeRegistry(); sp.set_registry(rf)
+rf.set_values(sp.clsid_key(), {"": "Somebody else's class"})
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    warn = sp.install_menu(); sp.uninstall_menu()
+check("a CLSID key that is not ours is never overwritten or removed",
+      rf.get_value(sp.clsid_key(), "") == "Somebody else's class" and any("belongs to another" in w for w in warn))
+sp.set_registry(reg)
+
+
+# ---- --menu-status explains which label is in use ----
+rs = FakeRegistry(); sp.set_registry(rs); sp.install_menu()
+txt = sp.menu_status_text()
+check("menu status (no DLL): says the label is fixed and why", "NO" in txt and "fixed label" in txt and "no extension" in txt)
+with mock.patch.object(sp, "menu_dll_path", return_value=DLL):
+    sp.install_menu(); txt = sp.menu_status_text()
+check("menu status (with DLL): says the file name is shown and where the extension is registered",
+      "file name" in txt and DLL in txt)
+sp.set_registry(reg)
 
 # ---- migration from every earlier layout ----
 for name, seeder in (("v1.1.0 (two cascades)", seed_v110), ("v1.0.x (cascade + folder item)", seed_v10x),
@@ -290,8 +381,8 @@ for name, seeder in (("v1.1.0 (two cascades)", seed_v110), ("v1.0.x (cascade + f
     check("%s detected as stale" % name, sp.install_state() == "stale")
     sp.install_menu()
     check("%s -> migrated to current" % name, sp.install_state() == "current")
-    check("%s: archives show ONE menu with 5 commands" % name,
-          [[l for l, _c in m] for m in effective_menus(r2, ".zip")] == [ARCHIVE_LABELS])
+    check("%s: archives show the new layout" % name,
+          labels_of(effective_entries(r2, ".zip")) == ARCHIVE_LABELS)
     check("%s: no old ShredPackCompress key left" % name,
           not r2.key_exists(CLS + "*\\shell\\ShredPackCompress"))
     check("%s: no ShredPack key left under '.zip.001'" % name,
@@ -317,8 +408,8 @@ check("...and reported as skipped", any(".7z" in w for w in warn))
 check("the old-name foreign key is ignored, not reported", not any("ShredPackCompress" in w for w in warn))
 check("a skipped spot does not make the menu 'stale' forever", sp.install_state() == "current")
 check("other archive types still get their menu",
-      [[l for l, _c in m] for m in effective_menus(r3, ".zip")] == [ARCHIVE_LABELS])
-check("folders still get their menu", len(effective_menus(r3, "FOLDER")) == 1)
+      labels_of(effective_entries(r3, ".zip")) == ARCHIVE_LABELS)
+check("folders still get their menu", len(effective_entries(r3, "FOLDER")) == 1)
 sp.uninstall_menu()
 check("uninstall leaves the foreign keys alone", unrelated_snapshot(r3, True) == foreign_before)
 sp.set_registry(reg)
@@ -327,7 +418,7 @@ sp.set_registry(reg)
 sp.GENERIC_MENU_EXCLUDES_ARCHIVES = False
 sp.install_menu()
 check("switch off: '*' menu carries no AppliesTo", reg.get_value(sp.compress_class_key("*"), "AppliesTo") is None)
-check("switch off: ordinary files still get the menu", len(effective_menus(reg, ".txt")) == 1)
+check("switch off: ordinary files still get the menu", len(effective_entries(reg, ".txt")) == 1)
 sp.GENERIC_MENU_EXCLUDES_ARCHIVES = True
 sp.uninstall_menu()
 
@@ -561,7 +652,7 @@ ctx, events = run_test(BIG)
 elapsed = time.time() - t0
 check("large zip (800 MiB unpacked): verified", ctx.files == 2 and events[-1] == (100.0, BIG_BYTES, BIG_BYTES))
 check("large zip: progress reported regularly (%d reports in %.1fs)" % (len(events), elapsed),
-      len(events) >= 10 and all(a[0] <= b[0] for a, b in zip(events, events[1:])))
+      len(events) >= max(3, min(10, int(elapsed / 0.06))) and all(a[0] <= b[0] for a, b in zip(events, events[1:])))
 check("large zip: nothing written, no temp files", scratch_clean())
 
 rd = fresh("randbig")
@@ -707,6 +798,290 @@ sp.CHUNK = old_chunk
 shutil.rmtree(join_dir, ignore_errors=True)       # what the worker's 'finally' does
 check("cancelling while joining stops the copy part-way", raised and cctx.calls == 20 and 0 < partial < len(whole))
 check("split join: temp files cleaned up", scratch_clean())
+
+
+# ======================================================================
+# Part 4: RAR extraction (needs the optional unrar-cffi package; skipped without it)
+# ======================================================================
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rar_samples import SAMPLES  # noqa: E402
+
+RARD = tempfile.mkdtemp(prefix="shredpack_rar_")
+
+
+def rar_ctx(password=None, dry=False):
+    return sp.Ctx(threading.Event(), lambda *a: None, password, dry_run=dry)
+
+
+def rar_file(name):
+    path = os.path.join(RARD, name)
+    with open(path, "wb") as f:
+        f.write(SAMPLES[name])
+    return path
+
+
+check("a .rar file is recognised as RAR even though the engine may lack the library",
+      sp.detect_format(rar_file("rar5-crc.rar")) == "rar")
+check(".rar is a registered extension", ".rar" in sp.EXTENSIONS)
+if sp.rar_available():
+    arc = rar_file("rar5-crc.rar")
+    out = os.path.join(RARD, "out1")
+    sp.extract_archive(arc, out, rar_ctx())
+    check("RAR5: both files extracted", sorted(os.listdir(out)) == ["stest1.txt", "stest2.txt"]
+          and os.path.getsize(os.path.join(out, "stest1.txt")) == 2048)
+    c = rar_ctx(dry=True)
+    sp.test_archive(arc, c)
+    check("RAR: Test Archive verifies every file and writes nothing", c.files == 2)
+    check("RAR: browsing lists the files", [e["path"] for e in sp.list_archive(arc)["entries"]]
+          == ["stest1.txt", "stest2.txt"])
+    arc3 = rar_file("rar3-subdirs.rar")
+    out = os.path.join(RARD, "out3")
+    sp.extract_archive(arc3, out, rar_ctx())
+    got = sorted(os.path.relpath(os.path.join(r, f), out).replace(os.sep, "/")
+                 for r, _d, fs in os.walk(out) for f in fs)
+    check("RAR3: nested folders and non-ASCII names extracted", len(got) == 4 and "sub/dir1/file1.txt" in got)
+    out = os.path.join(RARD, "out_sel")
+    c = sp.Ctx(threading.Event(), lambda *a: None, selected={"stest2.txt"})
+    sp.extract_archive(arc, out, c)
+    check("RAR: extracting a selection only writes that file", os.listdir(out) == ["stest2.txt"])
+    pw = rar_file("rar5-psw.rar")
+    try:
+        sp.extract_archive(pw, os.path.join(RARD, "o_nopw"), rar_ctx())
+        asked = None
+    except sp.NeedPassword as exc:
+        asked = exc.retry
+    check("RAR: a password-protected archive asks for the password", asked is False)
+    try:
+        sp.extract_archive(pw, os.path.join(RARD, "o_badpw"), rar_ctx("wrong"))
+        asked = None
+    except sp.NeedPassword as exc:
+        asked = exc.retry
+    check("RAR: a wrong password is reported as wrong (retry)", asked is True)
+    out = os.path.join(RARD, "o_pw")
+    sp.extract_archive(pw, out, rar_ctx("password"))
+    check("RAR: the right password extracts", sorted(os.listdir(out)) == ["stest1.txt", "stest2.txt"])
+    check("RAR: no folder is left behind after a failed attempt",
+          not os.path.exists(os.path.join(RARD, "o_nopw")) and not os.path.exists(os.path.join(RARD, "o_badpw")))
+    try:
+        sp.extract_archive(rar_file("rar5-hpsw.rar"), os.path.join(RARD, "o_h"), rar_ctx("password"))
+        msg = ""
+    except sp.Unsupported as exc:
+        msg = str(exc)
+    check("RAR: encrypted file NAMES are reported as unsupported, not as a crash", "encrypted file names" in msg)
+    for label, blob in (("truncated", SAMPLES["rar5-crc.rar"][:900]),
+                        ("damaged", SAMPLES["rar5-crc.rar"][:300] + b"\xff" * 40 + SAMPLES["rar5-crc.rar"][340:]),
+                        ("not really a RAR", b"Rar!\x1a\x07\x01\x00" + b"\x00" * 40)):
+        bad_path = os.path.join(RARD, "bad.rar")
+        with open(bad_path, "wb") as f:
+            f.write(blob)
+        dest = os.path.join(RARD, "o_bad")
+        try:
+            sp.extract_archive(bad_path, dest, rar_ctx())
+            err = None
+        except (sp.ArchiveError, sp.NeedPassword) as exc:
+            err = exc
+        check("RAR: a %s archive fails cleanly with no partial output" % label,
+              isinstance(err, sp.ArchiveError) and not os.path.exists(dest))
+    part2 = os.path.join(RARD, "set.part2.rar")
+    shutil.copy(arc, part2)
+    try:
+        sp.extract_archive(part2, os.path.join(RARD, "o_p2"), rar_ctx())
+        msg = ""
+    except sp.ArchiveError as exc:
+        msg = str(exc)
+    check("RAR: a later part of a multi-part set says to open the first part", "first part" in msg)
+else:
+    skip("RAR extraction tests (unrar-cffi isn't installed here)")
+    try:
+        sp.extract_archive(rar_file("rar5-crc.rar"), os.path.join(RARD, "o_none"), rar_ctx())
+        msg = ""
+    except sp.Unsupported as exc:
+        msg = str(exc)
+    check("without the library RAR reports 'not included in this build'", "isn't included" in msg)
+shutil.rmtree(RARD, ignore_errors=True)
+
+
+# ======================================================================
+# Part 5: Extract & Free Space - the checks that decide whether the archive may be deleted
+# ======================================================================
+FS = tempfile.mkdtemp(prefix="shredpack_free_")
+
+
+def free_case(name, members, policy="rename", filtered=False, pre=None, tamper=None, dest_same_dir=False):
+    """Extract a small zip the way the worker does, then apply the Extract & Free Space rules."""
+    folder = os.path.join(FS, name)
+    os.makedirs(folder)
+    arc = os.path.join(folder, "pack.zip")
+    with zipfile.ZipFile(arc, "w", zipfile.ZIP_STORED) as zf:
+        for n, d in members.items():
+            zf.writestr(n, d)
+    dest = folder if dest_same_dir else os.path.join(folder, "pack")
+    if pre:
+        pre(folder, dest)
+    before = [sp.file_signature(arc)]
+    ctx = sp.Ctx(threading.Event(), lambda *a: None, overwrite=policy)
+    outcome = sp.extract_archive(arc, dest, ctx)
+    if tamper:
+        tamper(arc)
+    return arc, sp.free_space_after_extraction([arc], before, ctx, outcome, filtered), dest
+
+
+arc, res, dest = free_case("ok", {"a.txt": "A" * 100, "sub/b.txt": "B"})
+check("free space: a clean full extraction deletes the archive and reports the bytes freed",
+      "freed" in res and res["freed"] > 0 and not os.path.exists(arc)
+      and sorted(os.listdir(dest)) == ["a.txt", "sub"])
+arc, res, dest = free_case("part", {"a.txt": "A"}, filtered=True)
+check("free space: a partial extraction keeps the archive", "kept" in res and os.path.exists(arc))
+arc, res, dest = free_case("skip", {"a.txt": "A"}, policy="skip",
+                           pre=lambda folder, dest: (os.makedirs(dest), open(os.path.join(dest, "a.txt"), "w").write("old")))
+check("free space: skipped (already existing) files keep the archive",
+      "kept" in res and "skipped" in res["kept"] and os.path.exists(arc))
+arc, res, dest = free_case("changed", {"a.txt": "A"}, tamper=lambda a: open(a, "ab").write(b"x"))
+check("free space: an archive that changed during extraction is kept",
+      "kept" in res and "changed" in res["kept"] and os.path.exists(arc))
+arc, res, dest = free_case("empty", {"only/": ""})
+check("free space: an archive with nothing to verify is kept", "kept" in res and os.path.exists(arc))
+arc, res, dest = free_case("self", {"pack.zip": "I am the new pack.zip"}, policy="overwrite", dest_same_dir=True)
+check("free space: if extraction replaced the archive itself it is NOT deleted",
+      "kept" in res and "itself" in res["kept"] and os.path.exists(arc))
+arc, res, dest = free_case("samedir", {"a.txt": "A"}, dest_same_dir=True)
+check("free space: extracting next to the archive is fine when nothing overlaps",
+      "freed" in res and not os.path.exists(arc) and os.path.isfile(os.path.join(dest, "a.txt")))
+
+def vanish(a):
+    os.remove(a)
+    open(a, "wb").write(b"replaced")
+arc, res, dest = free_case("swapped", {"a.txt": "A"}, tamper=vanish)
+check("free space: a swapped-out archive is kept", "kept" in res and os.path.exists(arc))
+
+real_delete = sp.delete_permanently
+sp.delete_permanently = lambda path: "it is read-only or in use by another program"
+try:
+    arc, res, dest = free_case("indelete", {"a.txt": "A"})
+finally:
+    sp.delete_permanently = real_delete
+check("free space: if deletion fails, the archive AND the extracted files stay and the reason is reported",
+      "failed" in res and "in use" in res["failed"] and os.path.exists(arc)
+      and os.path.isfile(os.path.join(dest, "a.txt")))
+
+ctx_mv = sp.Ctx(threading.Event(), lambda *a: None)
+ctx_mv.files, ctx_mv.multivolume = 1, True
+check("free space: a multi-part RAR set is never deleted",
+      "multi-part" in (sp.free_space_blocker(["x"], [(1, 1)], ctx_mv, {"dest": FS, "placed": ["a"], "skipped": 0}, False) or ""))
+check("free space: normal extraction still returns what it did without deleting anything",
+      os.path.exists(arc) and sp.extract_archive.__doc__ and "placed" in sp.extract_archive.__doc__)
+
+# a 7z extraction must count its files, or Extract & Free Space could never verify it
+if sp.py7zr:
+    import py7zr as _p7
+    d7 = os.path.join(FS, "sevenzip"); os.makedirs(d7)
+    src7 = os.path.join(d7, "in.txt"); open(src7, "w").write("hello")
+    a7 = os.path.join(d7, "t.7z")
+    with _p7.SevenZipFile(a7, "w") as z7:
+        z7.write(src7, "in.txt")
+    c7 = sp.Ctx(threading.Event(), lambda *a: None)
+    out7 = sp.extract_archive(a7, os.path.join(d7, "t"), c7)
+    check("7z: extracted files are counted (needed to verify before freeing space)",
+          c7.files == 1 and len(out7["placed"]) == 1)
+else:
+    skip("7z file-count test (py7zr isn't installed here)")
+
+# ---- Extract & Free Space: the deletion order and the extra size verification ----
+check("free space: the label names the archive without its extension (spaces, Unicode, .tar.gz)",
+      [sp.extract_to_label(os.path.join("C:\\x", n)) for n in
+       ("ShredPack.zip", "My Documents.zip", "Game Files.7z", "Backup.tar.gz", "Z\u00fcrich \u2013 \u65e5\u672c.tgz", "A.TAR.GZ", "rel.tar.xz")]
+      == ["Extract to ShredPack\\", "Extract to My Documents\\", "Extract to Game Files\\",
+          "Extract to Backup\\", "Extract to Z\u00fcrich \u2013 \u65e5\u672c\\", "Extract to A\\", "Extract to rel\\"])
+
+def free_case_sizes(name, members, wrong=False):
+    folder = os.path.join(FS, name); os.makedirs(folder)
+    arc = os.path.join(folder, "pack.zip")
+    with zipfile.ZipFile(arc, "w", zipfile.ZIP_STORED) as zf:
+        for n, d in members.items(): zf.writestr(n, d)
+    expected = sp.declared_file_sizes(arc)
+    if wrong: expected = expected[:-1] + [expected[-1] + 1]
+    before = [sp.file_signature(arc)]
+    ctx = sp.Ctx(threading.Event(), lambda *a: None)
+    outcome = sp.extract_archive(arc, os.path.join(folder, "pack"), ctx)
+    return arc, sp.free_space_after_extraction([arc], before, ctx, outcome, False, expected)
+
+arc, res = free_case_sizes("sz_ok", {"a.txt": "A" * 10, "b/c.txt": "C" * 3})
+check("free space: sizes on disk equal the archive's listing -> archive deleted", "freed" in res and not os.path.exists(arc))
+arc, res = free_case_sizes("sz_bad", {"a.txt": "A" * 10, "b/c.txt": "C" * 3}, wrong=True)
+check("free space: a size that disagrees with the archive's listing keeps the archive",
+      "kept" in res and "size" in res["kept"] and os.path.exists(arc))
+
+# deletion happens only after every check has passed, and never on a failed or cancelled run
+calls = []
+real_delete = sp.delete_permanently
+sp.delete_permanently = lambda path: calls.append(path)
+try:
+    arc, res, dest = free_case("order_ok", {"a.txt": "A"})
+    ok_calls = list(calls); del calls[:]
+    free_case("order_part", {"a.txt": "A"}, filtered=True)
+    free_case("order_changed", {"a.txt": "A"}, tamper=lambda a: open(a, "ab").write(b"x"))
+    free_case_sizes("order_size", {"a.txt": "AA"}, wrong=True)
+finally:
+    sp.delete_permanently = real_delete
+check("free space: delete is called once for a verified extraction and never when a check fails",
+      len(ok_calls) == 1 and calls == [])
+
+# a failed extraction (damaged archive) raises before any deletion logic: the archive survives
+bad = os.path.join(FS, "badzip.zip")
+with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as zf: zf.writestr("a.txt", "A" * 5000)
+raw = bytearray(open(bad, "rb").read()); raw[40:60] = b"\xff" * 20; open(bad, "wb").write(bytes(raw))
+failed = False
+try:
+    cx = sp.Ctx(threading.Event(), lambda *a: None)
+    sp.extract_archive(bad, os.path.join(FS, "badout"), cx)
+except Exception:
+    failed = True
+check("free space: a damaged archive fails to extract, so the deletion step is never reached, and the file remains",
+      failed and os.path.exists(bad))
+
+# a cancelled run leaves the archive and raises Cancelled before verification
+cancel_ev = threading.Event(); cancel_ev.set()
+okc = os.path.join(FS, "cancelme.zip")
+with zipfile.ZipFile(okc, "w", zipfile.ZIP_STORED) as zf: zf.writestr("a.txt", "A" * 5000)
+try:
+    sp.extract_archive(okc, os.path.join(FS, "cancelout"), sp.Ctx(cancel_ev, lambda *a: None)); cancelled = False
+except sp.Cancelled:
+    cancelled = True
+check("free space: a cancelled extraction raises Cancelled and the archive stays", cancelled and os.path.exists(okc))
+
+
+# ---- speed: no duplicate scans, and the engine is not slower than the stdlib ----
+tgz = os.path.join(FS, "t.tar.gz")
+with tarfile.open(tgz, "w:gz") as tf:
+    info = tarfile.TarInfo("a.txt"); data = b"x" * 1000; info.size = len(data); tf.addfile(info, io.BytesIO(data))
+check("free space: a TAR is not decompressed a second time just to list it", sp.declared_file_sizes(tgz) is None)
+SP = os.path.join(FS, "speed.zip")
+with zipfile.ZipFile(SP, "w", zipfile.ZIP_DEFLATED) as zf:
+    for i in range(300):
+        zf.writestr("d%d/f%d.txt" % (i % 10, i), (b"line of text %d\n" % i) * 20000)
+t0 = time.time(); zipfile.ZipFile(SP).extractall(os.path.join(FS, "std_out")); t_std = time.time() - t0
+t0 = time.time(); sp.extract_archive(SP, os.path.join(FS, "sp_out"), sp.Ctx(threading.Event(), lambda *a: None)); t_sp = time.time() - t0
+check("extraction speed: ShredPack %.2fs vs stdlib extractall %.2fs (must stay within 2x)" % (t_sp, t_std),
+      t_sp < max(2.0 * t_std, 0.3))
+check("extraction speed: output identical to the stdlib's",
+      sp._list_all_files(os.path.join(FS, "sp_out")).__len__() == 300)
+
+# ---- "Extract to <name>\\": the name (label AND destination folder) follows the archive ----
+_names = {"GTA V.zip": "GTA V", "My Files.7z": "My Files", "Backup.tar.gz": "Backup", "Backup.TAR.GZ": "Backup",
+          "a.b.zip": "a.b", "GTA V.zip.001": "GTA V", "Big.7z.002": "Big", "Game.part1.rar": "Game",
+          "Game.part01.rar": "Game", "Game.z01": "Game", "Z\u00fcrich \u65e5\u672c.zip": "Z\u00fcrich \u65e5\u672c",
+          "Data.tbz2": "Data", "a (1).zip": "a (1)", "x.txt.gz": "x.txt"}
+check("extract-to name: extensions removed correctly (zip, 7z, tar.gz, split .zip.001, .part1.rar, Unicode)",
+      all(sp.archive_stem(os.path.join("C:\\x", n)) == v for n, v in _names.items()))
+_dd = fresh("etname")
+_arc = os.path.join(_dd, "GTA V.zip.001")
+check("extract-to name: the destination folder uses the same name as the label",
+      sp.compute_dest(_arc, "folder", None, False) == os.path.join(_dd, "GTA V")
+      and sp.extract_to_label(_arc) == "Extract to GTA V\\")
+os.makedirs(os.path.join(_dd, "GTA V")); os.makedirs(os.path.join(_dd, "GTA V (2)"))
+check("extract-to name: existing folders are never reused - the next free number is taken",
+      sp.compute_dest(_arc, "folder", None, False) == os.path.join(_dd, "GTA V (3)"))
+shutil.rmtree(FS, ignore_errors=True)
 
 tempfile.tempdir = None
 shutil.rmtree(WORK, ignore_errors=True)

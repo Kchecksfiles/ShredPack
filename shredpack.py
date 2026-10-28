@@ -1,15 +1,16 @@
 """
 ShredPack - a WinRAR-style archive extractor with its own built-in engine.
 
-* No WinRAR, no 7-Zip: ShredPack extracts archives itself.
-* Right-click any archive -> ShredPack -> Extract files... / Extract Here /
-  Extract to folder named after the archive.
+* No WinRAR, no 7-Zip: ShredPack extracts archives itself (RAR extraction uses the
+  optional unrar-cffi package, which bundles the freely redistributable UnRAR source).
+* Right-click any archive -> Extract files... / Extract Here / Extract to a folder named after the archive,
+  plus an "Open with ShredPack" submenu (Extract & Free Space, Test, Add to ZIP, Add to archive).
 * The program only runs when you open it or pick a right-click option. It does
   its job and exits; nothing stays running in the background.
 
 Python packages bundled into the .exe at build time:
-    pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash pyinstaller
-(py7zr adds .7z, pycdlib adds .iso, pyzipper adds AES-encrypted ZIPs,
+    pip install py7zr pycdlib pyzipper tkinterdnd2 send2trash unrar-cffi pyinstaller
+(py7zr adds .7z, pycdlib adds .iso, pyzipper adds AES-encrypted ZIPs, unrar-cffi adds .rar,
  tkinterdnd2 adds drag-and-drop, send2trash sends deleted originals to the
  Recycle Bin. All are optional at run time.)
 """
@@ -93,7 +94,7 @@ except ImportError:
 # Constants
 # --------------------------------------------------------------------------
 APP_NAME = "ShredPack"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 MENU_KEY = "ShredPack"
 # Name of the separate compression cascade that v1.1.0 installed; only used now to
 # find and remove it (the commands live in the single "ShredPack" menu).
@@ -115,11 +116,12 @@ VERSION_URL = "https://raw.githubusercontent.com/Kchecksfiles/ShredPack/main/VER
 RELEASES_URL = "https://github.com/Kchecksfiles/ShredPack/releases"  # opened from the update link
 
 EXTENSIONS = (
-    ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz",
     ".iso", ".cab", ".xar", ".z01", ".zip.001",
 )
 TAR_COMPRESSED = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
-FORMATS_LABEL = "ZIP  \u2022  7Z  \u2022  TAR  \u2022  GZ  \u2022  BZ2  \u2022  XZ  \u2022  ISO  \u2022  CAB  \u2022  XAR  \u2022  split ZIP"
+FORMATS = ("ZIP", "7Z", "RAR", "TAR", "GZ", "BZ2", "XZ", "ISO", "CAB", "XAR", "split ZIP")
+FORMATS_LABEL = "  \u2022  ".join(FORMATS)
 
 # A decompression-bomb / low-disk-space guard. If an archive looks like it will
 # expand past this ratio, or won't fit the destination drive, the user is asked
@@ -135,26 +137,49 @@ CONFIRM_FILES = 100000
 CONFIRM_BYTES = 5 * 1024 ** 3
 BROWSE_LIMIT = 20000  # rows shown in the archive browser at once (search narrows the rest)
 
-# (registry sub-key name, menu text, mode). Explorer sorts sub-items by key name.
-# "Extract Here" always creates a new folder named after the archive right next
-# to it (see compute_dest) - there's no separate flat-extract option, to avoid
-# ever dumping an archive's loose files straight into an existing folder.
-MENU_ITEMS = (
-    ("1extract", "Extract files...", "dialog"),
-    ("2here", "Extract Here", "here"),
-    ("3test", "Test archive", "test"),
+# ---- Right-click menu layout -------------------------------------------------------
+# Right-clicking an ARCHIVE shows, in this order:
+#     Extract files...                      \
+#     Extract Here                           }  direct items (DIRECT_MENU_ITEMS)
+#     Extract to <archive name>\            /
+#     Open with ShredPack  >  Extract & Free Space... / Test archive / Add to ZIP /
+#                             Add to archive...                     (ARCHIVE_SUBMENU_ITEMS)
+# Right-clicking any other file or folder shows only "Open with ShredPack" with the two
+# compression commands (COMPRESS_MENU_ITEMS).
+#
+# Explorer lists classic shell verbs by registry key name, hence the numbered key names.
+# Windows can only show a fixed label for a registry-based verb, so without the native shell
+# extension (shell-ext/ShredPackMenu.dll, installer builds only - see MENU_DLL_NAME) the third
+# item reads "Extract to <archive name>\" literally. With it, Explorer asks the DLL for the
+# title each time and shows the real file name.
+# Installer-only: when ShredPackMenu.dll (a small native IExplorerCommand shell extension, built by
+# the Windows CI) sits next to ShredPack.exe, "Extract to ..." is registered through it so
+# Explorer shows the clicked archive's real name ("Extract to GTA V.zip"). Without the DLL
+# (portable exe, source runs, a build where the DLL failed) the static label above is used.
+MENU_DLL_NAME = "ShredPackMenu.dll"
+MENU_CLSID = "{6F3A1C52-8B1E-4D7A-9C35-2E8A5B7D41F0}"     # must match shell-ext/ShredPackMenu.cpp
+SUBMENU_LABEL = "Open with ShredPack"
+SUBMENU_KEY = "ShredPack4Open"        # the submenu on archive extensions (sorts after the direct items)
+OWNER_VALUE = "ShredPackItem"         # marker value on every top-level key ShredPack creates
+DIRECT_MENU_ITEMS = (
+    ("ShredPack1Extract", "Extract files...", "dialog"),
+    ("ShredPack2Here", "Extract Here", "here"),
+    ("ShredPack3Folder", "Extract to <archive name>\\", "folder"),
 )
-
-# The compression commands, shown on ordinary files and folders - and on
-# archives too, as part of their single combined menu (ARCHIVE_MENU_ITEMS).
-# Key names 4/5 keep them after the extraction items in that combined menu.
+# "&" starts an accelerator in a menu label, so a literal ampersand is written "&&".
+ARCHIVE_SUBMENU_ITEMS = (
+    ("1free", "Extract && Free Space...", "free"),
+    ("2test", "Test archive", "test"),
+    ("3addzip", "Add to ZIP", "compress-quick"),
+    ("4addarchive", "Add to archive...", "compress-dialog"),
+)
+# Shown on ordinary files and folders.
 COMPRESS_MENU_ITEMS = (
-    ("4addzip", "Add to ZIP", "compress-quick"),
-    ("5addarchive", "Add to archive...", "compress-dialog"),
+    ("1addzip", "Add to ZIP", "compress-quick"),
+    ("2addarchive", "Add to archive...", "compress-dialog"),
 )
-
-# What right-clicking an archive shows: ONE "ShredPack" menu with all five.
-ARCHIVE_MENU_ITEMS = MENU_ITEMS + COMPRESS_MENU_ITEMS
+# Every command an archive's menu launches, for tests and documentation.
+ARCHIVE_MENU_ITEMS = DIRECT_MENU_ITEMS + ARCHIVE_SUBMENU_ITEMS
 
 CHUNK = 1024 * 1024
 INVALID_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
@@ -164,18 +189,432 @@ RESERVED = (
     | {"LPT%d" % i for i in range(1, 10)}
 )
 
+# ---- Look: bold, flat, compact; ShredPack's blue stays the one accent colour ----
+# Fonts are resolved once a window exists (pick_fonts): Bahnschrift - Windows' built-in
+# DIN-style face - gives the headings their industrial look, Consolas the small caps labels.
 FONT = "Segoe UI"
 FONT_SEMI = "Segoe UI Semibold"
-BG = "#1f1f1f"
-CARD = "#2b2b2b"
-BORDER = "#3c3c3c"
-TEXT = "#f3f3f3"
-MUTED = "#a0a0a0"
-ACCENT = "#60cdff"
+FONT_DISPLAY = "Segoe UI Semibold"   # headings; replaced by "Bahnschrift" when installed
+FONT_MONO = "Consolas"               # tiny uppercase labels, numbers
+BG = "#161616"
+CARD = "#212121"
+BORDER = "#3a3a3a"
+TEXT = "#f5f5f5"
+MUTED = "#9d9d9d"
+DIM = "#707070"
+ACCENT = "#60cdff"          # ShredPack blue (unchanged)
+ACCENT_DEEP = "#1f6fe8"     # the deeper blue of the app icon
+ON_ACCENT = "#06202d"       # text/icons drawn on top of ACCENT
 ICON_BG = "#343434"
-TROUGH = "#3d3d3d"
+TROUGH = "#383838"
 GREEN = "#6ccb5f"
-FIELD = "#333333"
+DANGER = "#ff8c8c"
+FIELD = "#2c2c2c"
+KEY = "#2a2a2a"             # resting colour of a "key" (big button)
+KEY_HOVER = "#343434"
+
+
+def pick_fonts(root):
+    """Use Bahnschrift / Consolas when this PC has them; otherwise keep the Segoe UI defaults."""
+    global FONT_DISPLAY, FONT_MONO
+    try:
+        from tkinter import font as tkfont
+        families = set(tkfont.families(root))
+    except Exception:  # noqa: BLE001 - styling must never stop the app from starting
+        return
+    if "Bahnschrift" in families:
+        FONT_DISPLAY = "Bahnschrift"
+    if "Consolas" not in families:
+        for name in ("Cascadia Mono", "Courier New"):
+            if name in families:
+                FONT_MONO = name
+                break
+
+
+# The original ShredPack app icon (the blue tile with the white stack), as small PNGs for the
+# window header. Generated from shredpack.ico; the .ico itself is still the exe/window icon.
+LOGO_PNG_B64 = {
+    44: (
+        "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"
+    ),
+    66: (
+        "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"
+    ),
+    88: (
+        "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"
+    ),
+}
+
+# Window height (96-dpi pixels) per screen: each one is only as tall as its content.
+VIEW_HEIGHTS = {"home": 470, "choice": 590, "compress": 650, "browse": 600, "progress": 270,
+                "done": 300, "settings": 610}
+TOUR_EXTRA_HEIGHT = 140     # extra room on the home screen while the first-run tour is showing
+
+# The first-run tour: (title, text). Three steps, so it can be finished in three clicks.
+TOUR_STEPS = (
+    ("Open an archive",
+     "Drop one on the big box, or press Extract. ShredPack reads ZIP, 7Z, RAR, TAR, GZ, BZ2, XZ, "
+     "ISO, CAB and XAR."),
+    ("Right-click works too",
+     "On an archive: Extract files, Extract Here and Extract to <archive name>. "
+     "\"Open with ShredPack\" adds Extract & Free Space, Test archive and Add to ZIP."),
+    ("Make it yours",
+     "SETTINGS (top right) controls what happens to files that already exist and the finish "
+     "sound. Extract & Free Space always asks before it deletes anything."),
+)
 
 
 # --------------------------------------------------------------------------
@@ -270,6 +709,9 @@ def sanitize_name(name):
 
 def archive_stem(path):
     base = os.path.basename(path)
+    # Multi-part names: "GTA V.zip.001" / "Pack.7z.002" -> "GTA V" / "Pack"; "Game.part1.rar" -> "Game"
+    base = re.sub(r"(?i)\.(zip|7z)\.\d{2,4}$", "", base)
+    base = re.sub(r"(?i)\.part0*\d+\.rar$", "", base)
     low = base.lower()
     for ext in TAR_COMPRESSED + (".tar",):
         if low.endswith(ext):
@@ -278,6 +720,12 @@ def archive_stem(path):
     else:
         base = os.path.splitext(base)[0]
     return sanitize_name(base) or "Extracted"
+
+
+def extract_to_label(path):
+    """'Extract to <name>\\' for one archive: its file name without the archive extension
+    (compound ones such as .tar.gz included). Spaces and Unicode are kept."""
+    return "Extract to %s\\" % archive_stem(path)
 
 
 def unique_path(parent, name):
@@ -565,6 +1013,7 @@ class Ctx(object):
         self.overwrite = overwrite
         self.notes = []
         self.files = 0
+        self.multivolume = False   # set by the RAR reader when the archive is one part of a set
         self.total = 0
         self.done = 0
         self.unit = "bytes"   # "items" when an archive has entries but no data bytes at all
@@ -1054,6 +1503,9 @@ def extract_7z(path, stage, ctx):
         def report_start(self, processing_file_path, processing_bytes):
             ctx._check()
 
+        def report_update(self, decompressed_bytes):
+            pass        # required by py7zr 1.x; progress is reported per file in report_end
+
         def report_end(self, processing_file_path, wrote_bytes):
             ctx.add(int(wrote_bytes))
 
@@ -1086,8 +1538,10 @@ def extract_7z(path, stage, ctx):
                     z.extract(path=stage, targets=names, callback=Progress())
                 except TypeError:  # older py7zr without callback support on extract()
                     z.extract(path=stage, targets=names)
+                ctx.files = len(names)
             else:
                 z.extractall(path=stage, callback=Progress())
+                ctx.files = len(file_infos)
         sanitize_stage(stage, ctx)
     except (Cancelled, NeedPassword, ArchiveError):
         raise
@@ -1440,6 +1894,257 @@ def extract_xar(path, stage, ctx):
                 write_member(stage, parts, XarStream(f, heap + off, length, style), ctx)
 
 
+# ---- RAR (optional unrar-cffi) ---------------------------------------------------
+# ShredPack only ever READS RAR archives. Reading uses the optional "unrar-cffi" package,
+# a thin binding to RARLAB's UnRAR source, whose licence allows free redistribution for
+# extraction (it may not be used to create RAR archives, and ShredPack never does).
+# If the package isn't in a build, RAR files report a clear "not included" message.
+# Known limits, checked against sample archives: password-protected files are supported,
+# archives whose *file names* are encrypted are not, and ShredPack does not delete
+# multi-part RAR sets with Extract & Free Space.
+_RAR_END, _RAR_BAD_DATA, _RAR_BAD_ARCHIVE, _RAR_UNKNOWN_FORMAT, _RAR_EOPEN = 10, 12, 13, 14, 15
+_RAR_EREAD, _RAR_MISSING_PASSWORD, _RAR_BAD_PASSWORD = 18, 22, 24
+_RAR_SPLIT_BEFORE, _RAR_SPLIT_AFTER, _RAR_ENCRYPTED, _RAR_DIRECTORY = 0x1, 0x2, 0x4, 0x20
+_RAR_OP_SKIP, _RAR_OP_TEST = 0, 1          # we "test" every entry and stream the data ourselves
+_RAR_OM_EXTRACT, _RAR_OM_LIST_INCSPLIT = 1, 2
+_RAR_PART = re.compile(r"\.part0*(\d+)\.rar$", re.IGNORECASE)
+
+
+def rar_available():
+    try:
+        _rar_api()
+        return True
+    except Unsupported:
+        return False
+
+
+def _rar_api():
+    try:
+        from unrar.cffi import unrarlib  # noqa: F401 - importing it registers the C callback stub
+        from unrar.cffi._unrarlib import ffi, lib
+    except Exception:  # noqa: BLE001
+        raise Unsupported("RAR support isn't included in this build of ShredPack "
+                          "(the unrar-cffi package is missing).")
+    return ffi, lib
+
+
+class _RarReader(object):
+    """One pass over a RAR archive: read a header, then skip or stream that entry."""
+
+    def __init__(self, path, mode, password=None):
+        self.ffi, self.lib = _rar_api()
+        ffi, lib = self.ffi, self.lib
+        self.password = password or None
+        self.on_data = None          # called with each chunk of the entry being processed
+        self.error = None            # an exception raised inside on_data (e.g. Cancelled)
+        self.password_missing = False
+        self._name = ffi.new("wchar_t[]", path)
+        data = ffi.new("struct RAROpenArchiveDataEx *", {"ArcNameW": self._name, "OpenMode": mode})
+        self.handle = lib.RAROpenArchiveEx(data)
+        if not self.handle or data.OpenResult != 0:
+            code = data.OpenResult
+            if self.handle:
+                lib.RARCloseArchive(self.handle)
+                self.handle = None
+            raise self._failure(code, opening=True)
+        self._cb = ffi.new_handle(self._callback)     # must outlive every call into the library
+        lib.RARSetCallbackPtr(self.handle, lib.PyUNRARCALLBACKStub, self._cb)
+
+    def close(self):
+        if self.handle:
+            self.lib.RARCloseArchive(self.handle)
+            self.handle = None
+
+    def _callback(self, msg, p1, p2):
+        ffi, lib = self.ffi, self.lib
+        if msg == lib.UCM_PROCESSDATA:
+            if self.on_data is None:
+                return 1
+            try:
+                self.on_data(bytes(ffi.buffer(ffi.cast("char *", p1), p2)))
+                return 1
+            except BaseException as exc:  # noqa: BLE001 - nothing may escape into C code
+                self.error = exc
+                return -1
+        if msg in (lib.UCM_NEEDPASSWORDW, lib.UCM_NEEDPASSWORD):
+            if not self.password:
+                self.password_missing = True
+                return -1
+            if msg == lib.UCM_NEEDPASSWORDW:
+                buf, text = ffi.cast("wchar_t *", p1), self.password
+            else:
+                buf, text = ffi.cast("char *", p1), self.password.encode("utf-8", "replace")
+            n = min(len(text), max(0, p2 - 1))
+            for i in range(n):
+                buf[i] = text[i:i + 1] if isinstance(text, bytes) else text[i]
+            buf[n] = b"\0" if isinstance(text, bytes) else "\0"
+            return 1
+        if msg in (lib.UCM_CHANGEVOLUME, lib.UCM_CHANGEVOLUMEW):
+            return 1 if p2 == 1 else -1       # next part found (notify) / not found (ask)
+        return 1
+
+    def _failure(self, code, opening=False, encrypted=False):
+        """Turn a UnRAR result code into the exception ShredPack's callers expect."""
+        if self.error is not None:
+            return self.error
+        if self.password_missing or code == _RAR_MISSING_PASSWORD:
+            if opening:
+                return Unsupported("This RAR archive has encrypted file names, which ShredPack "
+                                   "can't open yet. Use another tool for this archive.")
+            return NeedPassword(False)
+        if code == _RAR_BAD_PASSWORD:
+            return NeedPassword(True)
+        if code == _RAR_BAD_DATA:
+            if encrypted and self.password:
+                return NeedPassword(True)     # a wrong RAR3 password only shows up as a bad checksum
+            return ArchiveError("The RAR archive looks corrupted: a file failed its checksum.")
+        if code == _RAR_BAD_ARCHIVE:
+            return ArchiveError("This doesn't look like a valid RAR archive, or it is damaged.")
+        if code == _RAR_UNKNOWN_FORMAT:
+            return Unsupported("This RAR archive uses a format ShredPack can't read.")
+        if code == _RAR_EOPEN:
+            return ArchiveError("Couldn't open the RAR archive. If it is part of a multi-part set, "
+                                "make sure every part is in the same folder and open the first part.")
+        if code == _RAR_EREAD:
+            return ArchiveError("The RAR archive is incomplete or couldn't be read.")
+        return ArchiveError("The RAR archive couldn't be read (error code %d)." % code)
+
+    def next_header(self):
+        """The next entry's header, or None at the end of the archive."""
+        hd = self.ffi.new("struct RARHeaderDataEx *")
+        res = self.lib.RARReadHeaderEx(self.handle, hd)
+        if res == _RAR_END:
+            return None
+        if res != 0:
+            raise self._failure(res)
+        return hd
+
+    def skip(self):
+        self.lib.RARProcessFileW(self.handle, _RAR_OP_SKIP, self.ffi.NULL, self.ffi.NULL)
+
+    def stream(self, hd, sink):
+        """Decode the current entry, passing its data to `sink`. Raises on any failure."""
+        self.on_data, self.error, self.password_missing = sink, None, False
+        res = self.lib.RARProcessFileW(self.handle, _RAR_OP_TEST, self.ffi.NULL, self.ffi.NULL)
+        self.on_data = None
+        if res != 0 or self.error is not None:
+            raise self._failure(res, encrypted=bool(hd.Flags & _RAR_ENCRYPTED))
+
+
+def _rar_name(hd, ffi):
+    return ffi.string(hd.FileNameW)
+
+
+def _rar_size(hd):
+    return hd.UnpSize + (hd.UnpSizeHigh << 32)
+
+
+def _rar_mtime(hd):
+    ft = (hd.MtimeHigh << 32) | hd.MtimeLow          # Windows FILETIME, 100 ns since 1601
+    if ft:
+        return ft / 1e7 - 11644473600.0
+    dos = hd.FileTime                                  # 2-second DOS timestamp fallback
+    try:
+        date, tm = dos >> 16, dos & 0xFFFF
+        import calendar
+        return float(calendar.timegm((1980 + (date >> 9), (date >> 5) & 0xF or 1, date & 0x1F or 1,
+                                      tm >> 11, (tm >> 5) & 0x3F, 2 * (tm & 0x1F))))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _rar_is_link(hd):
+    if hd.RedirType:
+        return True
+    return hd.HostOS == 3 and (hd.FileAttr & 0o170000) == 0o120000    # a Unix symlink
+
+
+def _rar_check_part_name(path):
+    m = _RAR_PART.search(path)
+    if m and int(m.group(1)) != 1:
+        raise ArchiveError("This is a later part of a multi-part RAR set. "
+                           "Open the first part (the one ending in .part1.rar) instead.")
+
+
+def rar_scan(path, password=None):
+    """Read a RAR archive's headers (no data). Returns a list of dicts."""
+    _rar_check_part_name(path)
+    reader = _RarReader(path, _RAR_OM_LIST_INCSPLIT, password)
+    ffi, entries = reader.ffi, []
+    try:
+        while True:
+            hd = reader.next_header()
+            if hd is None:
+                break
+            entries.append({
+                "name": _rar_name(hd, ffi), "size": _rar_size(hd),
+                "packed": hd.PackSize + (hd.PackSizeHigh << 32), "mtime": _rar_mtime(hd),
+                "is_dir": bool(hd.Flags & _RAR_DIRECTORY), "encrypted": bool(hd.Flags & _RAR_ENCRYPTED),
+                "split": bool(hd.Flags & (_RAR_SPLIT_BEFORE | _RAR_SPLIT_AFTER)),
+                "link": _rar_is_link(hd),
+            })
+            reader.skip()
+    except NeedPassword:
+        # Headers are only unreadable like this when the archive hides its file names.
+        raise Unsupported("This RAR archive has encrypted file names, which ShredPack "
+                          "can't open yet. Use another tool for this archive.")
+    finally:
+        reader.close()
+    return entries
+
+
+def extract_rar(path, stage, ctx):
+    entries = rar_scan(path)
+    ctx.multivolume = bool(_RAR_PART.search(path)) or any(e["split"] for e in entries)
+    want_total = 0
+    for e in entries:
+        parts = clean_parts(e["name"])
+        if parts and not e["is_dir"] and not e["link"] and ctx.wants(parts):
+            want_total += e["size"]
+    ctx.total = max(1, want_total)
+    reader = _RarReader(path, _RAR_OM_EXTRACT, ctx.password)
+    ffi, links = reader.ffi, 0
+    try:
+        while True:
+            ctx._check()
+            hd = reader.next_header()
+            if hd is None:
+                break
+            parts = clean_parts(_rar_name(hd, ffi))
+            is_dir = bool(hd.Flags & _RAR_DIRECTORY)
+            if _rar_is_link(hd):
+                links += 1
+                reader.skip()
+                continue
+            if not parts or not ctx.wants(parts, is_dir):
+                reader.skip()
+                continue
+            if is_dir:
+                if not ctx.dry_run:
+                    make_dir(stage, parts)
+                reader.skip()
+                continue
+            if ctx.dry_run:
+                reader.stream(hd, lambda chunk: ctx.add(len(chunk)))
+                ctx.files += 1
+                continue
+            target = os.path.join(stage, *parts)
+            os.makedirs(lp(os.path.dirname(target)), exist_ok=True)
+            with open(lp(target), "wb") as dst:
+                def sink(chunk, dst=dst):
+                    dst.write(chunk)
+                    ctx.add(len(chunk))
+                reader.stream(hd, sink)
+            mtime = _rar_mtime(hd)
+            if mtime:
+                _set_mtime(target, mtime)
+            ctx.files += 1
+    finally:
+        reader.close()
+    if links:
+        ctx.notes.append("%d link(s) in the archive were not restored." % links)
+
+
 # ---- format detection -----------------------------------------------------------
 HANDLERS = {
     "zip": extract_zip,
@@ -1449,6 +2154,7 @@ HANDLERS = {
     "iso": extract_iso,
     "cab": extract_cab,
     "xar": extract_xar,
+    "rar": extract_rar,
 }
 
 
@@ -1468,7 +2174,7 @@ def detect_format(path):
     if head[:4] == b"MSCF":
         return "cab"
     if head[:4] == b"Rar!":
-        raise Unsupported("RAR archives aren't supported by ShredPack's built-in engine.")
+        return "rar"
     if head[:5] in (b"MSWIM", b"WLPWM"):
         raise Unsupported("WIM images aren't supported by ShredPack's built-in engine.")
     if iso_sig in (b"CD001", b"BEA01"):
@@ -1479,7 +2185,7 @@ def detect_format(path):
         return "tar"
     if zipfile.is_zipfile(path):
         return "zip"
-    for ext, label in ((".rar", "RAR"), (".wim", "WIM"), (".dmg", "DMG"), (".vhd", "VHD"), (".vhdx", "VHDX")):
+    for ext, label in ((".wim", "WIM"), (".dmg", "DMG"), (".vhd", "VHD"), (".vhdx", "VHDX")):
         if low.endswith(ext):
             raise Unsupported("%s images/archives aren't supported by ShredPack's built-in engine." % label)
     if low.endswith(".iso"):
@@ -1503,6 +2209,8 @@ SETTINGS_DEFAULTS = {
     "delete_after": False,   # delete the original archive after a successful extraction
     "overwrite": "rename",   # one of the OVERWRITE_POLICIES keys
     "sound": True,           # short chime when a task finishes
+    "tutorial_done": False,  # the first-run tour was finished or skipped
+    "menu_declined": False,  # the user said no to adding the right-click menu at start-up
 }
 
 
@@ -1616,27 +2324,45 @@ def _sound(kind):
         return _sound_cache[kind]
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+
 def prime_sounds():
     """Build the sounds on a background thread so the chime is instant when a job ends."""
-    if sys.platform == "win32":
+    if IS_WINDOWS:
         threading.Thread(target=lambda: (_sound("done"), _sound("error")), daemon=True).start()
 
 
+SOUND_TAIL_MS = 350     # extra time before the process may exit: audio devices need a moment to wake
+
+
 def play_sound(kind):
-    """Play 'done' or 'error' without blocking. Returns its length in ms (0 = nothing played).
+    """Play 'done' or 'error' without blocking. Returns how long the process should stay alive
+    for it to be heard, in ms (0 = nothing played).
 
     winsound can't play from memory asynchronously (SND_MEMORY | SND_ASYNC raises
     RuntimeError), so the in-memory WAV plays on a short-lived daemon thread instead.
     """
-    if sys.platform != "win32":
+    if not IS_WINDOWS:
         return 0
     try:
         import winsound
         data, ms = _sound(kind)
-        threading.Thread(target=winsound.PlaySound, args=(data, winsound.SND_MEMORY),
-                         daemon=True).start()
-        return ms
+
+        def run():
+            try:
+                winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+            except Exception:  # noqa: BLE001
+                log_exception("Completion sound failed")
+                try:
+                    winsound.MessageBeep(winsound.MB_OK)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return ms + SOUND_TAIL_MS
     except Exception:  # noqa: BLE001 - a sound must never break an extraction
+        log_exception("Couldn't start the completion sound")
         return 0
 
 
@@ -1708,7 +2434,7 @@ def _list_all_files(folder):
 def compute_dest(arc, mode, dest_dir, subfolder):
     base = os.path.dirname(arc)
     stem = archive_stem(arc)
-    if mode in ("here", "folder"):
+    if mode in ("here", "folder", "free"):
         # "Extract Here" always lands in a new folder named after the archive,
         # next to the archive itself - never dumps loose files into that folder.
         return unique_path(base, stem)
@@ -1718,7 +2444,10 @@ def compute_dest(arc, mode, dest_dir, subfolder):
 def extract_archive(path, dest, ctx, motw_source=None):
     """Extract `path` into `dest` (created if needed). Raises on any failure.
     If `motw_source` is given, its download "Mark of the Web" (if any) is
-    copied onto every file that lands in `dest` from this extraction."""
+    copied onto every file that lands in `dest` from this extraction.
+    Returns what was done: {'dest', 'placed' (relative paths of files newly written),
+    'skipped', 'replaced', 'files' (files the reader processed)} - Extract & Free Space
+    uses it to decide whether deleting the archive is safe."""
     existed = os.path.isdir(lp(dest))
     os.makedirs(lp(dest), exist_ok=True)
     stage = None
@@ -1738,6 +2467,8 @@ def extract_archive(path, dest, ctx, motw_source=None):
             ctx.notes.append("%d existing file(s) were overwritten." % stats["replaced"])
         if motw_source:
             propagate_mark_of_the_web(motw_source, dest, placed)
+        result = {"dest": dest, "placed": placed, "skipped": stats.get("skipped", 0),
+                  "replaced": stats.get("replaced", 0), "files": ctx.files}
     except BaseException:
         if stage:
             shutil.rmtree(lp(stage), ignore_errors=True)
@@ -1749,6 +2480,124 @@ def extract_archive(path, dest, ctx, motw_source=None):
         raise
     else:
         shutil.rmtree(lp(stage), ignore_errors=True)
+        return result
+
+
+# --------------------------------------------------------------------------
+# Extract & Free Space: extract, then permanently delete the original archive
+# --------------------------------------------------------------------------
+# The goal is to give disk space back. It is a separate action from ordinary extraction,
+# which never deletes anything. The archive is deleted only when EVERY check below passes;
+# otherwise it is kept and the reason is shown. It is deleted permanently (not sent to the
+# Recycle Bin), because a Recycle Bin copy would not free any space.
+def file_signature(path):
+    """(size, mtime in ns) of a file, or None if it can't be read."""
+    try:
+        st = os.stat(lp(path))
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def free_space_blocker(originals, before, ctx, outcome, filtered, expected_sizes=None):
+    """None if it is safe to delete `originals` after this extraction, otherwise a short
+    reason (shown to the user) why they must be kept.
+
+    originals - the archive file(s) to delete (all parts of a split archive)
+    before    - their file_signature() values taken before extraction started
+    ctx       - the finished extraction's Ctx
+    outcome   - what extract_archive() returned
+    filtered  - True if only part of the archive was selected for extraction
+    expected_sizes - None, or the file sizes the archive's own table of contents declares;
+                     when given, the sizes on disk must match them exactly"""
+    if filtered:
+        return "only part of the archive was extracted"
+    if getattr(ctx, "multivolume", False):
+        return "it is part of a multi-part RAR set, and ShredPack can't safely remove every part"
+    if not outcome or not outcome.get("dest"):
+        return "the extraction result couldn't be confirmed"
+    if outcome["skipped"]:
+        return "some files already existed and were skipped, so not everything was extracted"
+    placed = outcome["placed"]
+    if ctx.files == 0 or not placed:
+        return "the archive contained no files to verify"
+    if len(placed) != ctx.files:
+        return "the number of files written doesn't match the number in the archive"
+    dest = outcome["dest"]
+    wrote = set()
+    for rel in placed:
+        full = os.path.join(dest, rel)
+        if not os.path.isfile(lp(full)):
+            return "an extracted file is missing from the destination"
+        wrote.add(os.path.normcase(os.path.abspath(full)))
+    if expected_sizes is not None:
+        try:
+            on_disk = sorted(os.path.getsize(lp(os.path.join(dest, rel))) for rel in placed)
+        except OSError:
+            return "an extracted file couldn't be read back"
+        if on_disk != sorted(expected_sizes):
+            return "the size of an extracted file doesn't match the archive's listing"
+    for orig, sig in zip(originals, before):
+        if os.path.normcase(os.path.abspath(orig)) in wrote:
+            return "the extraction replaced the archive itself"
+        if _is_link_or_reparse(orig):
+            return "the archive is a shortcut or link, not a regular file"
+        now = file_signature(orig)
+        if now is None:
+            return "the archive is no longer where it was"
+        if sig is None or now != sig:
+            return "the archive changed while it was being extracted"
+    return None
+
+
+def delete_permanently(path):
+    """Delete one file for good. Returns None on success or a short reason on failure."""
+    try:
+        os.remove(lp(path))
+        return None
+    except PermissionError:
+        try:                                    # a read-only file: clear the flag and retry once
+            os.chmod(lp(path), 0o666)
+            os.remove(lp(path))
+            return None
+        except OSError:
+            return "it is read-only or in use by another program"
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return exc.strerror or "the file couldn't be removed"
+
+
+def declared_file_sizes(path, password=None):
+    """The sizes of the files an archive says it holds (from its table of contents), or None
+    when the format can't tell (any size unknown, or the listing can't be read). None means
+    'no extra check', never 'passed'."""
+    try:
+        if detect_format(path) not in ("zip", "7z"):
+            return None      # listing a TAR / single-file stream means decompressing it all again
+        entries = list_archive(path, password)["entries"]
+    except (ArchiveError, NeedPassword, Unsupported, OSError):
+        return None
+    sizes = [e["size"] for e in entries if not e["is_dir"]]
+    if any(not isinstance(n, int) for n in sizes):
+        return None
+    return sizes
+
+
+def free_space_after_extraction(originals, before, ctx, outcome, filtered, expected_sizes=None):
+    """Apply the Extract & Free Space rules. Returns a dict with exactly one of:
+    {'freed': bytes}      - the archive(s) were deleted
+    {'kept': reason}      - checks didn't pass; nothing was deleted
+    {'failed': reason}    - checks passed but deletion failed (extracted files are kept)"""
+    reason = free_space_blocker(originals, before, ctx, outcome, filtered, expected_sizes)
+    if reason:
+        return {"kept": reason}
+    freed = sum(sig[0] for sig in before if sig)
+    for path in originals:
+        problem = delete_permanently(path)
+        if problem:
+            return {"failed": problem}
+    return {"freed": freed}
 
 
 def test_archive(path, ctx):
@@ -1767,7 +2616,7 @@ def test_archive(path, ctx):
 
 FORMAT_LABELS = {
     "zip": "ZIP", "tar": "TAR", "single": "Compressed file", "7z": "7-Zip",
-    "iso": "ISO image", "cab": "CAB (Windows cabinet)", "xar": "XAR",
+    "iso": "ISO image", "cab": "CAB (Windows cabinet)", "xar": "XAR", "rar": "RAR",
 }
 
 
@@ -1876,6 +2725,15 @@ def list_archive(path, password=None):
             parts = clean_parts(name)
             if parts:
                 entries.append(_entry(parts, size, None, _dos_datetime(fdate, ftime), False))
+
+    elif fmt == "rar":
+        for e in rar_scan(path, password):
+            parts = clean_parts(e["name"])
+            if parts and not e["link"]:
+                encrypted = encrypted or e["encrypted"]
+                entries.append(_entry(parts, None if e["is_dir"] else e["size"],
+                                      None if e["is_dir"] else e["packed"], e["mtime"],
+                                      e["is_dir"], e["encrypted"]))
 
     elif fmt == "xar":
         with open(path, "rb") as f:
@@ -2238,7 +3096,31 @@ def menu_command(mode):
     return '%s --mode %s "%%1"' % (launcher_command(), mode)
 
 
+def menu_dll_path():
+    """The Explorer extension DLL beside the installed ShredPack.exe, or None (portable exe,
+    running from source, or a build without it)."""
+    if not getattr(sys, "frozen", False):
+        return None
+    path = os.path.join(os.path.dirname(sys.executable), MENU_DLL_NAME)
+    return path if os.path.isfile(path) else None
+
+
+def clsid_key():
+    return r"Software\Classes\CLSID\%s" % MENU_CLSID
+
+
 def ext_key(ext):
+    """The 'Open with ShredPack' submenu on an archive extension."""
+    return r"Software\Classes\SystemFileAssociations\%s\shell\%s" % (ext, SUBMENU_KEY)
+
+
+def ext_verb_key(ext, name):
+    """One of the direct items (Extract files... / Extract Here / Extract to <name>\\)."""
+    return r"Software\Classes\SystemFileAssociations\%s\shell\%s" % (ext, name)
+
+
+def legacy_ext_key(ext):
+    """Where v1.0.x - v1.1.x put the single 'ShredPack' cascade on an archive extension."""
     return r"Software\Classes\SystemFileAssociations\%s\shell\%s" % (ext, MENU_KEY)
 
 
@@ -2338,12 +3220,15 @@ def _notify_shell():
 def _owned_by_shredpack(reg, path):
     """True only if the key at `path` was created by ShredPack (any version), so
     a same-named key belonging to some other program is never touched.
-      * the cascade layouts (v1.0.x and later) carry MUIVerb = "ShredPack";
+      * the current layout marks every top-level key with OWNER_VALUE;
+      * the cascade layouts of v1.0.x - v1.1.x carry MUIVerb = "ShredPack";
       * the very first layout had a default value mentioning ShredPack and a
         command line launching it."""
     if not reg.key_exists(path):
         return False
-    if reg.get_value(path, "MUIVerb") == APP_NAME:
+    if reg.get_value(path, OWNER_VALUE) is not None:
+        return True
+    if reg.get_value(path, "MUIVerb") in (APP_NAME, SUBMENU_LABEL):
         return True
     default = reg.get_value(path, "") or ""
     command = reg.get_value(path + "\\command", "") or ""
@@ -2358,10 +3243,15 @@ def _delete_tree(reg, path):
 
 def _all_menu_paths():
     """Every key path a ShredPack menu could occupy, current and from older versions."""
-    paths = [ext_key(ext) for ext in EXTENSIONS]            # incl. old '.zip.001'
+    paths = []
+    for ext in EXTENSIONS:                                   # incl. old '.zip.001'
+        paths.append(legacy_ext_key(ext))
+        paths.append(ext_key(ext))
+        paths.extend(ext_verb_key(ext, name) for name, _l, _m in DIRECT_MENU_ITEMS)
     for cls in COMPRESS_CLASSES:
         paths.append(compress_class_key(cls))
         paths.append(legacy_compress_class_key(cls))
+    paths.append(clsid_key())
     return paths
 
 
@@ -2382,9 +3272,27 @@ def _current_icon():
     return '"%s",0' % sys.executable if getattr(sys, "frozen", False) else None
 
 
+def _direct_plan(ext, icon, dll=None):
+    """[(key path, values)] for the three direct items of one archive extension. With the
+    shell-extension DLL, "Extract to ..." is served by it (its title is the archive's name);
+    otherwise it is an ordinary verb with a fixed label."""
+    plan = []
+    for name, label, mode in DIRECT_MENU_ITEMS:
+        base = ext_verb_key(ext, name)
+        if dll and mode == "folder":
+            plan.append((base, {"ExplorerCommandHandler": MENU_CLSID, OWNER_VALUE: APP_NAME}))
+            continue
+        values = {"MUIVerb": label, OWNER_VALUE: APP_NAME}
+        if icon:
+            values["Icon"] = icon
+        plan.append((base, values))
+        plan.append((base + "\\command", {"": menu_command(mode)}))
+    return plan
+
+
 def _cascade_plan(base, items, icon, applies_to=None):
-    """[(key path, {value name: value})] for one cascading 'ShredPack' menu."""
-    top = {"MUIVerb": APP_NAME, "SubCommands": ""}
+    """[(key path, {value name: value})] for one 'Open with ShredPack' submenu."""
+    top = {"MUIVerb": SUBMENU_LABEL, "SubCommands": "", OWNER_VALUE: APP_NAME}
     if icon:
         top["Icon"] = icon
     if applies_to:
@@ -2399,11 +3307,17 @@ def _cascade_plan(base, items, icon, applies_to=None):
 
 def _menu_plan(icon):
     """The complete set of registry keys a correct installation consists of:
-    one combined menu per archive extension, and the compression-only menu on
-    files ('*', hidden on archives) and folders ('Directory')."""
+    per archive extension the three direct items plus the 'Open with ShredPack'
+    submenu, and the compression-only submenu on files ('*', hidden on archives)
+    and folders ('Directory')."""
     plan = []
+    dll = menu_dll_path()
+    if dll:
+        plan.append((clsid_key(), {"": "ShredPack Extract-to menu", OWNER_VALUE: APP_NAME}))
+        plan.append((clsid_key() + "\\InprocServer32", {"": dll, "ThreadingModel": "Apartment"}))
     for ext in registry_extensions():
-        plan.extend(_cascade_plan(ext_key(ext), ARCHIVE_MENU_ITEMS, icon))
+        plan.extend(_direct_plan(ext, icon, dll))
+        plan.extend(_cascade_plan(ext_key(ext), ARCHIVE_SUBMENU_ITEMS, icon))
     for cls in COMPRESS_CLASSES:
         applies = archive_applies_to() if (cls == "*" and GENERIC_MENU_EXCLUDES_ARCHIVES) else None
         plan.extend(_cascade_plan(compress_class_key(cls), COMPRESS_MENU_ITEMS, icon, applies))
@@ -2412,7 +3326,7 @@ def _menu_plan(icon):
 
 def _foreign_blockers(reg):
     """Spots ShredPack would install into that another program's key occupies."""
-    tops = [p for p, v in _menu_plan(None) if v.get("MUIVerb") == APP_NAME]
+    tops = [p for p, v in _menu_plan(None) if OWNER_VALUE in v]
     return [p for p in tops if reg.key_exists(p) and not _owned_by_shredpack(reg, p)]
 
 
@@ -2434,6 +3348,36 @@ def install_menu():
         reg.set_values(path, values)
     reg.notify()
     return warnings
+
+
+def menu_status_text():
+    """Plain-language report on why 'Extract to ...' shows a file name or the generic label."""
+    dll = menu_dll_path()
+    reg = registry()
+    lines = ["ShredPack %s" % APP_VERSION, "Program: %s" % sys.executable,
+             "Explorer extension (%s) next to the program: %s" % (MENU_DLL_NAME, "yes" if dll else "NO")]
+    if reg is None:
+        lines.append("Registry: not available on this system")
+        return "\n".join(lines)
+    verb = ext_verb_key(".zip", "ShredPack3Folder")
+    handler = reg.get_value(verb, "ExplorerCommandHandler")
+    lines.append("Menu registered: %s" % install_state())
+    lines.append("'Extract to' entry on .zip files uses: %s" % (
+        "the Explorer extension (shows the archive's file name)" if handler else
+        "a fixed label (%s)" % (reg.get_value(verb, "MUIVerb") or "not registered")))
+    if handler:
+        server = reg.get_value(clsid_key() + "\\InprocServer32", "")
+        lines.append("Extension registered at: %s" % (server or "NOT REGISTERED"))
+        if server and not os.path.isfile(server):
+            lines.append("WARNING: that file no longer exists")
+    if not dll:
+        lines.append("")
+        lines.append("This copy has no extension, so the label stays generic. Install with ShredPack-Setup.exe "
+                     "from a build where the 'Explorer menu extension' CI step succeeded.")
+    elif not handler:
+        lines.append("")
+        lines.append("The extension is present but not registered: run ShredPack.exe --install, then reopen Explorer.")
+    return "\n".join(lines)
 
 
 def install_state():
@@ -2466,9 +3410,17 @@ def install_state():
 # --------------------------------------------------------------------------
 # The application window
 # --------------------------------------------------------------------------
+def is_instant_mode(mode, settings):
+    """Right-click extractions that run straight through with no options screen:
+    'Extract to <name>\\' always; 'Extract Here' unless the user turned that off."""
+    return mode == "folder" or (mode == "here" and bool(settings.get("quick_here", True)))
+
+
 class ShredPackApp(object):
     def __init__(self, root, archives=None, mode="dialog", from_shell=False, compact=False):
         self.root = root
+        self._alive = True        # False once the Tk window is destroyed
+        self._jobs = set()        # pending root.after ids, cancelled on destroy
         self.from_shell = from_shell
         self.archives = []
         self.mode = mode
@@ -2476,16 +3428,20 @@ class ShredPackApp(object):
         # Right-click actions that run straight through get a small, flat progress window that
         # stays hidden unless the job lasts more than a blink.
         self.compact = bool(from_shell and (compact or (
-            archives and mode == "here" and self.settings.get("quick_here", True))))
+            archives and is_instant_mode(mode, self.settings))))
         self._hidden = False
         self._settings_prev = "home"
         self.k = max(1.0, root.winfo_fpixels("1i") / 96.0)
+        self.tour_active, self.tour_step = False, 0
+        self._views = ()
+        pick_fonts(root)
 
         self.state = "home"  # home | choice | compress_choice | processing | finished
         self.action = "extract"  # "extract" or "compress" - which flow "processing" belongs to
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.pw_event = threading.Event()
+        self.ask_event, self.ask_value = threading.Event(), False
         self.pw_value = None
         self.cur_idx, self.cur_n = 1, 1
 
@@ -2511,11 +3467,12 @@ class ShredPackApp(object):
             except tk.TclError:
                 pass
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        self._win_w, self._screen_h = self.px(560), sh
         if self.compact:
-            w, h = self.px(440), self.px(118)
+            w, h = self.px(440), self.px(128)
         else:
-            w = self.px(600)
-            h = min(self.px(680), sh - self.px(90))
+            w = self._win_w
+            h = min(self.px(VIEW_HEIGHTS["home"]), sh - self.px(90))
         root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, max(0, (sh - h) // 3)))
 
         self._build_styles()
@@ -2531,25 +3488,84 @@ class ShredPackApp(object):
         if self.compact:
             self._hidden = True
             root.withdraw()
+        else:
+            self._present()          # configure the window while it is certainly alive
 
+        # Start the requested action last: it may ask a question and, if declined, close the
+        # window (right-click launches). Nothing below touches Tk after that.
         if archives:
             self.open_archives(archives, mode)
         else:
             self.go_home()
 
-        if not self._hidden:
-            enable_dark_titlebar(root)
-            root.attributes("-topmost", True)
-            root.after(400, lambda: root.attributes("-topmost", False))
-            root.lift()
-            root.focus_force()
+        if not self._alive:
+            return
 
         if not from_shell:
             check_for_update(self._on_update_result)
 
+    # ---- window lifecycle ---------------------------------------------------
+    @property
+    def alive(self):
+        return self._alive
+
+    def _after(self, ms, fn):
+        """root.after that never fires on a destroyed window: jobs are tracked, cancelled
+        by _destroy(), and re-check the lifecycle flag when they run."""
+        if not self._alive:
+            return None
+        job = [None]
+
+        def run():
+            self._jobs.discard(job[0])
+            if self._alive:
+                fn()
+
+        job[0] = self.root.after(max(int(ms), 0), run)
+        self._jobs.add(job[0])
+        return job[0]
+
+    def _destroy(self):
+        """Close the window exactly once; later calls (a second timer, a late button click)
+        are no-ops instead of Tk commands on a dead interpreter."""
+        if not self._alive:
+            return
+        self._alive = False
+        for job in list(self._jobs):
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._jobs.clear()
+        if self._filter_job is not None:
+            try:
+                self.root.after_cancel(self._filter_job)
+            except tk.TclError:
+                pass
+            self._filter_job = None
+        self.cancel.set()
+        self.pw_event.set()      # release a worker waiting for a password answer
+        self.ask_value = False
+        self.ask_event.set()
+        self.root.destroy()
+
+    def _present(self):
+        """Bring a visible window to the front (only while it is alive)."""
+        if not self._alive:
+            return
+        enable_dark_titlebar(self.root)
+        self.root.attributes("-topmost", True)
+        self._after(400, lambda: self.root.attributes("-topmost", False))
+        self.root.lift()
+        self.root.focus_force()
+
     def _on_update_result(self, latest):
-        if latest:
-            self.root.after(0, lambda: self.update_link.config(text="Update available: v" + latest))
+        if latest and self._alive:
+            try:
+                self.root.after(0, lambda: self._alive and self.update_link.config(
+                    text="Update available: v" + latest))
+            except (tk.TclError, RuntimeError):
+                pass         # the window closed while the version check was running
 
     def px(self, v):
         return int(round(v * self.k))
@@ -2561,41 +3577,46 @@ class ShredPackApp(object):
             s.theme_use("clam")
         except tk.TclError:
             pass
-        pad = (self.px(20), self.px(10))
-        s.configure("Primary.TButton", background=ACCENT, foreground="#08222e", borderwidth=0,
-                    focusthickness=0, focuscolor=ACCENT, padding=pad, font=(FONT_SEMI, 10))
-        s.map("Primary.TButton", background=[("pressed", "#4bb8e8"), ("active", "#7fd7ff")])
-        s.configure("Secondary.TButton", background="#3a3a3a", foreground=TEXT, borderwidth=0,
-                    focusthickness=0, focuscolor="#3a3a3a", padding=pad, font=(FONT, 10))
-        s.map("Secondary.TButton", background=[("pressed", "#505050"), ("active", "#454545")])
+        pad = (self.px(16), self.px(8))
+        bold = (FONT_DISPLAY, 10, "bold")
+        s.configure("Primary.TButton", background=ACCENT, foreground=ON_ACCENT, borderwidth=0,
+                    focusthickness=0, focuscolor=ACCENT, padding=pad, font=bold, relief="flat")
+        s.map("Primary.TButton", background=[("pressed", "#3fb4ea"), ("active", "#86daff")])
+        s.configure("Secondary.TButton", background=KEY, foreground=TEXT, borderwidth=0,
+                    focusthickness=0, focuscolor=KEY, padding=pad, font=bold, relief="flat")
+        s.map("Secondary.TButton", background=[("pressed", "#454545"), ("active", KEY_HOVER)])
+        s.configure("Danger.TButton", background="#3a2424", foreground=DANGER, borderwidth=0,
+                    focusthickness=0, focuscolor="#3a2424", padding=pad, font=bold, relief="flat")
+        s.map("Danger.TButton", background=[("pressed", "#5a3030"), ("active", "#4a2b2b")])
         s.configure("Zen.TCheckbutton", background=CARD, foreground=TEXT, font=(FONT, 10),
-                    focuscolor=CARD, indicatorbackground="#3a3a3a", indicatorforeground="#08222e",
-                    upperbordercolor=BORDER, lowerbordercolor=BORDER, padding=(0, self.px(4)))
+                    focuscolor=CARD, indicatorbackground=KEY, indicatorforeground=ON_ACCENT,
+                    upperbordercolor=BORDER, lowerbordercolor=BORDER, padding=(0, self.px(3)))
         s.map("Zen.TCheckbutton", background=[("active", CARD)], foreground=[("active", TEXT)],
-              indicatorbackground=[("selected", ACCENT), ("active", "#454545")])
+              indicatorbackground=[("selected", ACCENT), ("active", KEY_HOVER)])
         s.configure("Zen.Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
                     bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, borderwidth=0,
-                    thickness=self.px(6))
+                    thickness=self.px(8))
         s.configure("Mini.Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
                     bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT, borderwidth=0,
-                    thickness=self.px(4))
+                    thickness=self.px(8))
         s.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
-                    borderwidth=0, rowheight=self.px(24), font=(FONT, 10))
-        s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#08222e")])
-        s.configure("Treeview.Heading", background="#3a3a3a", foreground=TEXT, borderwidth=0,
-                    relief="flat", font=(FONT_SEMI, 9), padding=(self.px(6), self.px(5)))
-        s.map("Treeview.Heading", background=[("active", "#454545")])
-        s.configure("Vertical.TScrollbar", background="#3a3a3a", troughcolor=CARD,
+                    borderwidth=0, rowheight=self.px(22), font=(FONT, 10))
+        s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", ON_ACCENT)])
+        s.configure("Treeview.Heading", background=KEY, foreground=TEXT, borderwidth=0,
+                    relief="flat", font=(FONT_MONO, 8, "bold"), padding=(self.px(6), self.px(4)))
+        s.map("Treeview.Heading", background=[("active", KEY_HOVER)])
+        s.configure("Vertical.TScrollbar", background=KEY, troughcolor=CARD,
                     bordercolor=CARD, arrowcolor=TEXT, relief="flat", borderwidth=0)
-        s.configure("TCombobox", fieldbackground=FIELD, background="#3a3a3a", foreground=TEXT,
+        s.configure("TCombobox", fieldbackground=FIELD, background=KEY, foreground=TEXT,
                     arrowcolor=TEXT, bordercolor=BORDER, lightcolor=FIELD, darkcolor=FIELD)
         s.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)],
               selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", TEXT)])
         self.root.option_add("*TCombobox*Listbox.background", FIELD)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", "#08222e")
+        self.root.option_add("*TCombobox*Listbox.selectForeground", ON_ACCENT)
 
+    # ---- small building blocks ------------------------------------------------
     def _entry(self, parent, var, **kw):
         e = tk.Entry(parent, textvariable=var, font=(FONT, 10), bg=FIELD, fg=TEXT,
                      insertbackground=TEXT, relief="flat", highlightthickness=1,
@@ -2603,47 +3624,114 @@ class ShredPackApp(object):
         return e
 
     def _card(self, parent):
+        """A flat panel with a short blue tab along its top edge."""
         card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        tab = tk.Frame(card, bg=CARD, height=self.px(3))
+        tab.pack(fill="x")
+        tk.Frame(tab, bg=ACCENT, width=self.px(56), height=self.px(3)).place(x=0, y=0)
         inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill="both", expand=True, padx=self.px(26), pady=self.px(22))
+        inner.pack(fill="both", expand=True, padx=self.px(20), pady=(self.px(14), self.px(16)))
         return card, inner
 
     def _label(self, parent, text="", size=10, semi=False, color=MUTED, **kw):
         return tk.Label(parent, text=text, font=(FONT_SEMI if semi else FONT, size),
                         fg=color, bg=CARD, **kw)
 
-    def _draw_logo(self, canvas):
-        """The mark: a stack of slanted shreds, longest on top."""
+    def _heading(self, parent, text, size=18, bg=CARD, **kw):
+        return tk.Label(parent, text=text, font=(FONT_DISPLAY, size, "bold"), fg=TEXT, bg=bg, **kw)
+
+    def _tag(self, parent, text, bg=CARD, color=DIM, **kw):
+        """Tiny uppercase monospace caption, e.g. '01  DESTINATION'."""
+        return tk.Label(parent, text=text.upper(), font=(FONT_MONO, 8), fg=color, bg=bg,
+                        anchor="w", **kw)
+
+    def _rule(self, parent, bg=CARD, pady=None):
+        line = tk.Frame(parent, bg=BORDER, height=1)
+        line.pack(fill="x", pady=pady if pady is not None else self.px(12))
+        return line
+
+    def _key(self, parent, tag, title, command, primary=False):
+        """A big flat button ('key') with a tiny caption: bold, rectangular, easy to hit."""
         px = self.px
-        for i, (w, color) in enumerate(((24, ACCENT), (18, TEXT), (12, GREEN))):
-            y, h, lean, x0 = px(4 + i * 9), px(6), px(5), px(1)
-            canvas.create_polygon(x0 + lean, y, x0 + lean + px(w), y, x0 + px(w), y + h, x0, y + h,
-                                  fill=color, outline="")
+        bg = ACCENT if primary else KEY
+        hover = "#86daff" if primary else KEY_HOVER
+        fg = ON_ACCENT if primary else TEXT
+        sub = ON_ACCENT if primary else DIM
+        frame = tk.Frame(parent, bg=bg, cursor="hand2", highlightthickness=1,
+                         highlightbackground=ACCENT if primary else BORDER)
+        cap = tk.Label(frame, text=tag.upper(), font=(FONT_MONO, 8), fg=sub, bg=bg, anchor="w")
+        cap.pack(fill="x", padx=px(12), pady=(px(10), 0))
+        name = tk.Label(frame, text=title, font=(FONT_DISPLAY, 15, "bold"), fg=fg, bg=bg, anchor="w")
+        name.pack(fill="x", padx=px(12), pady=(px(10), px(12)))
+        parts = (frame, cap, name)
+
+        def paint(color):
+            for w in parts:
+                w.config(bg=color)
+
+        for w in parts:
+            w.bind("<Enter>", lambda e, c=hover: paint(c))
+            w.bind("<Leave>", lambda e, c=bg: paint(c))
+            w.bind("<Button-1>", lambda e: command())
+        return frame
+
+    def _chip(self, parent, text, command=None):
+        chip = tk.Label(parent, text=text, font=(FONT_MONO, 9, "bold"), fg=MUTED, bg=BG,
+                        padx=self.px(7), pady=self.px(2), highlightthickness=1,
+                        highlightbackground=BORDER)
+        if command:
+            chip.config(cursor="hand2")
+            chip.bind("<Button-1>", lambda e: command())
+            chip.bind("<Enter>", lambda e: chip.config(fg=ACCENT, highlightbackground=ACCENT))
+            chip.bind("<Leave>", lambda e: chip.config(fg=MUTED, highlightbackground=BORDER))
+        return chip
+
+    # ---- the ShredPack mark: the app icon itself, drawn from an embedded PNG ----------
+    def _logo(self, parent, size, bg=BG):
+        """The original blue ShredPack icon at roughly `size` pixels (96-dpi units)."""
+        want = self.px(size)
+        sizes = sorted(LOGO_PNG_B64)
+        pick = min(sizes, key=lambda n: (n < want, abs(n - want)))
+        try:
+            img = tk.PhotoImage(data=LOGO_PNG_B64[pick])
+            label = tk.Label(parent, image=img, bg=bg, bd=0)
+            label.image = img            # keep a reference or Tk drops the picture
+            return label
+        except Exception:  # noqa: BLE001 - no PNG support: fall back to a plain blue tile
+            tile = tk.Canvas(parent, width=want, height=want, bg=bg, highlightthickness=0)
+            rounded_rect(tile, 0, 0, want, want, want // 4, fill=ACCENT_DEEP, outline="")
+            return tile
 
     def _build_ui(self):
         px = self.px
         header = tk.Frame(self.root, bg=BG)
         if not self.compact:
-            header.pack(fill="x", padx=px(28), pady=(px(22), px(12)))
-        logo = tk.Canvas(header, width=px(30), height=px(30), bg=BG, highlightthickness=0)
-        logo.pack(side="left")
-        self._draw_logo(logo)
-        tk.Label(header, text=APP_NAME, font=(FONT_SEMI, 15), fg=TEXT, bg=BG).pack(
-            side="left", padx=(px(10), 0))
-        self.settings_link = tk.Label(
-            header, text="Settings", font=(FONT, 9), fg=MUTED, bg=BG, cursor="hand2")
+            header.pack(fill="x", padx=px(20), pady=(px(16), px(10)))
+        self._logo(header, 46).pack(side="left")
+        titles = tk.Frame(header, bg=BG)
+        titles.pack(side="left", padx=(px(12), 0))
+        tk.Label(titles, text=APP_NAME, font=(FONT_DISPLAY, 29, "bold"), fg=TEXT, bg=BG,
+                 anchor="w").pack(anchor="w")
+        self._tag(titles, "Archive tool  ·  v" + APP_VERSION, bg=BG).pack(anchor="w")
+        right = tk.Frame(header, bg=BG)
+        right.pack(side="right", anchor="n")
+        self.settings_link = self._chip(right, "SETTINGS", self.open_settings)
         self.settings_link.pack(side="right")
-        self.settings_link.bind("<Button-1>", lambda e: self.open_settings())
-        self.update_link = tk.Label(
-            header, text="", font=(FONT, 9, "underline"), fg=ACCENT, bg=BG, cursor="hand2")
-        self.update_link.pack(side="right", padx=(0, px(14)))
+        self.update_link = tk.Label(right, text="", font=(FONT_MONO, 9, "bold"), fg=ACCENT, bg=BG,
+                                    cursor="hand2")
+        self.update_link.pack(side="right", padx=(0, px(10)))
         self.update_link.bind("<Button-1>", lambda e: open_url(RELEASES_URL))
+        if not self.compact:
+            rule = tk.Frame(self.root, bg=BG, height=px(3))
+            rule.pack(fill="x", padx=px(20))
+            line = tk.Frame(rule, bg=BORDER, height=1)
+            line.place(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0)
 
         body = tk.Frame(self.root, bg=BG)
         if self.compact:
             body.pack(fill="both", expand=True, padx=px(20), pady=px(12))
         else:
-            body.pack(fill="both", expand=True, padx=px(28), pady=(0, px(24)))
+            body.pack(fill="both", expand=True, padx=px(20), pady=(px(14), px(16)))
 
         self._build_home(body)
         self._build_choice(body)
@@ -2652,45 +3740,77 @@ class ShredPackApp(object):
         self._build_progress(body)
         self._build_done(body)
         self._build_settings(body)
+        self._views = (("home", self.view_home), ("choice", self.view_choice),
+                       ("compress", self.view_compress), ("browse", self.view_browse),
+                       ("progress", self.view_progress), ("done", self.view_done),
+                       ("settings", self.view_settings))
 
     def _build_home(self, body):
         px = self.px
         self.view_home = tk.Frame(body, bg=BG)
         inner = self.view_home
 
-        zw, zh = px(500), px(206)
+        zw, zh = px(520), px(128)
         zone = tk.Canvas(inner, width=zw, height=zh, bg=BG, highlightthickness=0, cursor="hand2")
-        zone.pack(pady=(px(6), 0))
-        rounded_rect(zone, px(2), px(2), zw - px(2), zh - px(2), px(18),
-                     fill=CARD, outline="#4a4a4a", width=1, dash=(px(5), px(5)))
-        cx, cy = zw // 2, px(70)
-        zone.create_oval(cx - px(30), cy - px(30), cx + px(30), cy + px(30), fill=ACCENT, outline="")
-        zone.create_line(cx, cy - px(11), cx, cy + px(8), fill="#0b2530", width=px(3), capstyle="round")
-        zone.create_line(cx - px(9), cy, cx, cy + px(9), cx + px(9), cy, fill="#0b2530", width=px(3),
-                         capstyle="round", joinstyle="round")
-        zone.create_text(cx, px(134), text="Drop archives here" if DND_FILES else "Choose an archive",
-                         font=(FONT_SEMI, 15), fill=TEXT)
-        zone.create_text(cx, px(162), text="or click to browse", font=(FONT, 10), fill=MUTED)
+        zone.pack()
+        rounded_rect(zone, px(2), px(2), zw - px(2), zh - px(2), px(10),
+                     fill=CARD, outline="#4a4a4a", width=1, dash=(px(5), px(4)))
+        tx, ty, ts = px(26), px(24), px(80)           # the arrow tile
+        zone.create_rectangle(tx, ty, tx + ts, ty + ts, fill=ACCENT, outline="")
+        cx, cy = tx + ts // 2, ty + ts // 2
+        zone.create_line(cx, cy - px(20), cx, cy + px(14), fill=ON_ACCENT, width=px(6), capstyle="butt")
+        zone.create_line(cx - px(17), cy - px(2), cx, cy + px(15), cx + px(17), cy - px(2),
+                         fill=ON_ACCENT, width=px(6), capstyle="butt", joinstyle="miter")
+        zone.create_text(px(128), px(48), anchor="w",
+                         text="DROP ARCHIVES HERE" if DND_FILES else "CHOOSE AN ARCHIVE",
+                         font=(FONT_DISPLAY, 17, "bold"), fill=TEXT)
+        zone.create_text(px(128), px(76), anchor="w", text="or click to browse",
+                         font=(FONT, 10), fill=MUTED)
+        zone.create_text(px(128), px(98), anchor="w", text="EXTRACT  ·  TEST  ·  BROWSE",
+                         font=(FONT_MONO, 8), fill=DIM)
         zone.bind("<Button-1>", lambda e: self.choose_archives())
 
-        btn_row = tk.Frame(inner, bg=BG)
-        btn_row.pack(pady=(px(18), 0))
-        ttk.Button(btn_row, text="Choose Archive...", style="Primary.TButton",
-                   command=self.choose_archives).pack(side="left")
-        ttk.Button(btn_row, text="Create Archive...", style="Secondary.TButton",
-                   command=self.choose_compress_entry).pack(side="left", padx=(px(10), 0))
-        ttk.Button(btn_row, text="Checksum...", style="Secondary.TButton",
-                   command=self.choose_checksum).pack(side="left", padx=(px(10), 0))
-        tk.Label(inner, text=FORMATS_LABEL, font=(FONT, 8), fg="#7c7c7c", bg=BG).pack(pady=(px(14), 0))
+        keys = tk.Frame(inner, bg=BG)
+        keys.pack(fill="x", pady=(px(12), 0))
+        for col in range(3):
+            keys.columnconfigure(col, weight=1, uniform="keys")
+        specs = (("01  open archive", "Extract", self.choose_archives, True),
+                 ("02  new archive", "Create", self.choose_compress_entry, False),
+                 ("03  verify file", "Checksum", self.choose_checksum, False))
+        for col, (tag, title, command, primary) in enumerate(specs):
+            self._key(keys, tag, title, command, primary).grid(
+                row=0, column=col, sticky="ew", padx=(0 if col == 0 else px(8), 0))
 
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(18), px(10)))
-        self.menu_row = tk.Frame(inner, bg=BG)
-        self.menu_row.pack(fill="x")
-        self.lbl_menu = tk.Label(self.menu_row, text="", font=(FONT, 10), fg=TEXT, bg=BG, anchor="w")
-        self.lbl_menu.pack(side="left")
-        self.btn_menu = ttk.Button(self.menu_row, text="", style="Secondary.TButton",
-                                   command=self.toggle_menu)
-        self.btn_menu.pack(side="right")
+        self._tag(inner, "Reads", bg=BG).pack(anchor="w", pady=(px(14), px(4)))
+        chips = tk.Frame(inner, bg=BG)
+        chips.pack(fill="x")
+        for name in FORMATS[:-1]:
+            self._chip(chips, name).pack(side="left", padx=(0, px(5)))
+        note = "Creates ZIP, 7Z and TAR.  RAR is extract-only."
+        tk.Label(inner, text=note, font=(FONT_MONO, 8), fg=DIM, bg=BG, anchor="w").pack(
+            anchor="w", pady=(px(6), 0))
+
+        # First-run tour: a slim strip under the keys, never a blocking window.
+        self.tour = tk.Frame(inner, bg=CARD, highlightbackground=ACCENT, highlightthickness=1)
+        tour_in = tk.Frame(self.tour, bg=CARD)
+        tour_in.pack(fill="x", padx=px(14), pady=px(10))
+        top = tk.Frame(tour_in, bg=CARD)
+        top.pack(fill="x")
+        self.lbl_tour_step = self._tag(top, "Quick tour  1/%d" % len(TOUR_STEPS), color=ACCENT)
+        self.lbl_tour_step.pack(side="left")
+        skip = tk.Label(top, text="SKIP TOUR", font=(FONT_MONO, 8, "bold"), fg=MUTED, bg=CARD,
+                        cursor="hand2")
+        skip.pack(side="right")
+        skip.bind("<Button-1>", lambda e: self.tour_finish())
+        self.lbl_tour_title = tk.Label(tour_in, text="", font=(FONT_DISPLAY, 13, "bold"), fg=TEXT,
+                                       bg=CARD, anchor="w")
+        self.lbl_tour_title.pack(fill="x", pady=(px(6), 0))
+        self.lbl_tour_body = tk.Label(tour_in, text="", font=(FONT, 9), fg=MUTED, bg=CARD,
+                                      anchor="w", justify="left", wraplength=px(470))
+        self.lbl_tour_body.pack(fill="x", pady=(px(3), px(8)))
+        self.btn_tour_next = ttk.Button(tour_in, text="Next", style="Primary.TButton",
+                                        command=self.tour_next)
+        self.btn_tour_next.pack(anchor="e")
 
     def _build_choice(self, body):
         px = self.px
@@ -2700,27 +3820,30 @@ class ShredPackApp(object):
         ttk.Button(bottom, text="Cancel", style="Secondary.TButton",
                    command=self.cancel_choice).pack(side="right")
         ttk.Button(bottom, text="Extract", style="Primary.TButton",
-                   command=self.begin).pack(side="right", padx=(0, px(10)))
+                   command=self.begin).pack(side="right", padx=(0, px(8)))
+        self.btn_free = ttk.Button(bottom, text="Extract & Free Space", style="Danger.TButton",
+                                   command=self.begin_free)
+        self.btn_free.pack(side="right", padx=(0, px(8)))
         self.btn_test = ttk.Button(bottom, text="Test", style="Secondary.TButton",
                                    command=self.test_selected)
         self.btn_test.pack(side="left")
-        self.btn_browse = ttk.Button(bottom, text="Browse...", style="Secondary.TButton",
+        self.btn_browse = ttk.Button(bottom, text="Browse", style="Secondary.TButton",
                                      command=self.open_browser)
         self.btn_browse.pack(side="left", padx=(px(8), 0))
 
-        self.lbl_name = self._label(inner, "", 14, True, TEXT, anchor="w", justify="left",
-                                    wraplength=px(480))
-        self.lbl_name.pack(fill="x")
-        self.lbl_meta = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(480))
+        self._tag(inner, "Archive").pack(fill="x")
+        self.lbl_name = self._heading(inner, "", 17, anchor="w", justify="left", wraplength=px(470))
+        self.lbl_name.pack(fill="x", pady=(px(2), 0))
+        self.lbl_meta = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(470))
         self.lbl_meta.pack(fill="x", pady=(px(2), 0))
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=px(14))
+        self._rule(inner)
 
-        self.lbl_section = self._label(inner, "", 10, anchor="w")
+        self.lbl_section = self._tag(inner, "")
         self.lbl_section.pack(fill="x")
 
         # Mode-dependent area (rebuilt in refresh_choice, always sits here).
         self.dest_area = tk.Frame(inner, bg=CARD)
-        self.dest_area.pack(fill="x", pady=(px(8), 0))
+        self.dest_area.pack(fill="x", pady=(px(6), 0))
 
         self.dest_var = tk.StringVar()
         self.dest_row = tk.Frame(self.dest_area, bg=CARD)
@@ -2728,36 +3851,36 @@ class ShredPackApp(object):
             self.dest_row, textvariable=self.dest_var, font=(FONT, 10), bg=FIELD, fg=TEXT,
             insertbackground=TEXT, relief="flat", highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=ACCENT)
-        self.dest_entry.pack(side="left", fill="x", expand=True, ipady=px(7))
-        ttk.Button(self.dest_row, text="Browse...", style="Secondary.TButton",
-                   command=self.pick_folder).pack(side="left", padx=(px(10), 0))
+        self.dest_entry.pack(side="left", fill="x", expand=True, ipady=px(6))
+        ttk.Button(self.dest_row, text="Browse", style="Secondary.TButton",
+                   command=self.pick_folder).pack(side="left", padx=(px(8), 0))
 
         self.sub_var = tk.BooleanVar(value=False)
         self.sub_chk = ttk.Checkbutton(self.dest_area, text="Create a folder named after the archive",
                                        variable=self.sub_var, style="Zen.TCheckbutton")
         self.lbl_hint = self._label(self.dest_area, "", 10, anchor="w", justify="left",
-                                    wraplength=px(480))
+                                    wraplength=px(470))
 
         self.lbl_sel = self._label(inner, "", 10, color=ACCENT, anchor="w", justify="left",
-                                   wraplength=px(480))
+                                   wraplength=px(470))
 
         # "Delete original" and "If a file already exists" live in Settings now; the variables
         # stay (filled from the saved settings) because begin() reads them.
         self.delete_var = tk.BooleanVar(value=False)
         self.overwrite_var = tk.StringVar(value=OVERWRITE_POLICIES[0][1])
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(14), px(8)))
+        self._rule(inner, pady=(px(12), px(8)))
         opt_row = tk.Frame(inner, bg=CARD)
         opt_row.pack(fill="x")
-        self.lbl_opts = self._label(opt_row, "", 9, anchor="w", justify="left", wraplength=px(370))
+        self.lbl_opts = self._label(opt_row, "", 9, anchor="w", justify="left", wraplength=px(360))
         self.lbl_opts.pack(side="left")
-        opts_link = tk.Label(opt_row, text="Change in Settings", font=(FONT, 9, "underline"),
+        opts_link = tk.Label(opt_row, text="CHANGE IN SETTINGS", font=(FONT_MONO, 8, "bold"),
                              fg=ACCENT, bg=CARD, cursor="hand2")
         opts_link.pack(side="right")
         opts_link.bind("<Button-1>", lambda e: self.open_settings())
         flt = tk.Frame(inner, bg=CARD)
-        flt.pack(fill="x", pady=(px(8), 0))
-        self._label(flt, "Only extract", 10, anchor="w").grid(row=0, column=0, sticky="w")
-        self._label(flt, "Skip", 10, anchor="w").grid(row=0, column=1, sticky="w", padx=(px(10), 0))
+        flt.pack(fill="x", pady=(px(10), 0))
+        self._tag(flt, "Only extract").grid(row=0, column=0, sticky="w")
+        self._tag(flt, "Skip").grid(row=0, column=1, sticky="w", padx=(px(10), 0))
         self.include_var = tk.StringVar()
         self.exclude_var = tk.StringVar()
         self._entry(flt, self.include_var).grid(row=1, column=0, sticky="ew", ipady=px(5))
@@ -2766,7 +3889,7 @@ class ShredPackApp(object):
         flt.columnconfigure(0, weight=1)
         flt.columnconfigure(1, weight=1)
         self._label(inner, "Wildcards, e.g. *.jpg, *.pdf  (leave empty to extract everything)", 8,
-                    color="#7c7c7c", anchor="w").pack(fill="x", pady=(px(3), 0))
+                    color=DIM, anchor="w").pack(fill="x", pady=(px(3), 0))
 
     def _build_compress(self, body):
         px = self.px
@@ -2776,25 +3899,25 @@ class ShredPackApp(object):
         ttk.Button(bottom, text="Cancel", style="Secondary.TButton",
                    command=self.cancel_compress).pack(side="right")
         ttk.Button(bottom, text="Compress", style="Primary.TButton",
-                   command=self.begin_compress).pack(side="right", padx=(0, px(10)))
+                   command=self.begin_compress).pack(side="right", padx=(0, px(8)))
 
-        self.lbl_cx_name = self._label(inner, "", 14, True, TEXT, anchor="w", justify="left",
-                                       wraplength=px(480))
-        self.lbl_cx_name.pack(fill="x")
-        self.lbl_cx_meta = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(480))
+        self._tag(inner, "New archive").pack(fill="x")
+        self.lbl_cx_name = self._heading(inner, "", 17, anchor="w", justify="left", wraplength=px(470))
+        self.lbl_cx_name.pack(fill="x", pady=(px(2), 0))
+        self.lbl_cx_meta = self._label(inner, "", 10, anchor="w", justify="left", wraplength=px(470))
         self.lbl_cx_meta.pack(fill="x", pady=(px(2), 0))
         add_row = tk.Frame(inner, bg=CARD)
         add_row.pack(fill="x", pady=(px(8), 0))
-        ttk.Button(add_row, text="Add Files...", style="Secondary.TButton",
+        ttk.Button(add_row, text="Add Files", style="Secondary.TButton",
                    command=self.add_compress_files).pack(side="left")
-        ttk.Button(add_row, text="Add Folder...", style="Secondary.TButton",
+        ttk.Button(add_row, text="Add Folder", style="Secondary.TButton",
                    command=self.add_compress_folder).pack(side="left", padx=(px(8), 0))
 
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=px(14))
+        self._rule(inner)
 
         fmt_row = tk.Frame(inner, bg=CARD)
         fmt_row.pack(fill="x")
-        self._label(fmt_row, "Format", 10, anchor="w").pack(side="left")
+        self._tag(fmt_row, "Format").pack(side="left")
         self.compress_fmt_var = tk.StringVar(value="ZIP")
         self.fmt_combo = ttk.Combobox(
             fmt_row, textvariable=self.compress_fmt_var, state="readonly",
@@ -2804,14 +3927,14 @@ class ShredPackApp(object):
 
         lvl_row = tk.Frame(inner, bg=CARD)
         lvl_row.pack(fill="x", pady=(px(8), 0))
-        self._label(lvl_row, "Compression level", 10, anchor="w").pack(side="left")
+        self._tag(lvl_row, "Compression level").pack(side="left")
         self.compress_level_var = tk.StringVar(value=COMPRESS_LEVELS[2][1])
         self.level_combo = ttk.Combobox(
             lvl_row, textvariable=self.compress_level_var, state="readonly",
             values=[label for _k, label in COMPRESS_LEVELS], width=22)
         self.level_combo.pack(side="right")
 
-        self._label(inner, "Archive name", 10, anchor="w").pack(fill="x", pady=(px(12), 0))
+        self._tag(inner, "Archive name").pack(fill="x", pady=(px(12), 0))
         name_row = tk.Frame(inner, bg=CARD)
         name_row.pack(fill="x", pady=(px(4), 0))
         self.compress_name_var = tk.StringVar()
@@ -2820,9 +3943,9 @@ class ShredPackApp(object):
             name_row, textvariable=self.compress_name_var, font=(FONT, 10), bg=FIELD, fg=TEXT,
             insertbackground=TEXT, relief="flat", highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=ACCENT)
-        self.name_entry.pack(side="left", fill="x", expand=True, ipady=px(7))
+        self.name_entry.pack(side="left", fill="x", expand=True, ipady=px(6))
 
-        self._label(inner, "Destination folder", 10, anchor="w").pack(fill="x", pady=(px(12), 0))
+        self._tag(inner, "Destination folder").pack(fill="x", pady=(px(12), 0))
         dest_row = tk.Frame(inner, bg=CARD)
         dest_row.pack(fill="x", pady=(px(4), 0))
         self.compress_dest_var = tk.StringVar()
@@ -2830,22 +3953,22 @@ class ShredPackApp(object):
             dest_row, textvariable=self.compress_dest_var, font=(FONT, 10), bg=FIELD, fg=TEXT,
             insertbackground=TEXT, relief="flat", highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=ACCENT)
-        self.cdest_entry.pack(side="left", fill="x", expand=True, ipady=px(7))
-        ttk.Button(dest_row, text="Browse...", style="Secondary.TButton",
-                   command=self.pick_compress_folder).pack(side="left", padx=(px(10), 0))
+        self.cdest_entry.pack(side="left", fill="x", expand=True, ipady=px(6))
+        ttk.Button(dest_row, text="Browse", style="Secondary.TButton",
+                   command=self.pick_compress_folder).pack(side="left", padx=(px(8), 0))
 
         self.encrypt_var = tk.BooleanVar(value=False)
         self.encrypt_chk = ttk.Checkbutton(
             inner, text="Encrypt with a password (ZIP/7Z only)", variable=self.encrypt_var,
             style="Zen.TCheckbutton", command=self._toggle_password_field)
-        self.encrypt_chk.pack(anchor="w", pady=(px(14), 0))
+        self.encrypt_chk.pack(anchor="w", pady=(px(12), 0))
 
         self.compress_password_var = tk.StringVar()
         self.pw_entry = tk.Entry(
             inner, textvariable=self.compress_password_var, show="*", font=(FONT, 10),
             bg=FIELD, fg=TEXT, insertbackground=TEXT, relief="flat", highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=ACCENT, state="disabled")
-        self.pw_entry.pack(fill="x", pady=(px(6), 0), ipady=px(7))
+        self.pw_entry.pack(fill="x", pady=(px(6), 0), ipady=px(6))
 
     def _build_browse(self, body):
         px = self.px
@@ -2854,15 +3977,15 @@ class ShredPackApp(object):
         bottom.pack(side="bottom", fill="x", pady=(px(10), 0))
         ttk.Button(bottom, text="Back", style="Secondary.TButton",
                    command=self.browse_back).pack(side="left")
-        ttk.Button(bottom, text="Extract All...", style="Secondary.TButton",
+        ttk.Button(bottom, text="Extract All", style="Secondary.TButton",
                    command=lambda: self.browse_extract(False)).pack(side="right")
-        ttk.Button(bottom, text="Extract Selected...", style="Primary.TButton",
+        ttk.Button(bottom, text="Extract Selected", style="Primary.TButton",
                    command=lambda: self.browse_extract(True)).pack(side="right", padx=(0, px(8)))
 
-        self.lbl_b_name = self._label(inner, "", 13, True, TEXT, anchor="w", justify="left",
-                                      wraplength=px(500))
-        self.lbl_b_name.pack(fill="x")
-        self.lbl_b_info = self._label(inner, "", 9, anchor="w", justify="left", wraplength=px(500))
+        self._tag(inner, "Contents").pack(fill="x")
+        self.lbl_b_name = self._heading(inner, "", 16, anchor="w", justify="left", wraplength=px(480))
+        self.lbl_b_name.pack(fill="x", pady=(px(2), 0))
+        self.lbl_b_info = self._label(inner, "", 9, anchor="w", justify="left", wraplength=px(480))
         self.lbl_b_info.pack(fill="x", pady=(px(2), px(8)))
 
         search_row = tk.Frame(inner, bg=CARD)
@@ -2878,11 +4001,11 @@ class ShredPackApp(object):
         tree_frame.pack(fill="both", expand=True, pady=(px(8), 0))
         self.tree = ttk.Treeview(tree_frame, columns=("size", "packed", "modified"),
                                  selectmode="extended")
-        self.tree.heading("#0", text="Name", anchor="w")
-        self.tree.heading("size", text="Size", anchor="e")
-        self.tree.heading("packed", text="Packed", anchor="e")
-        self.tree.heading("modified", text="Modified", anchor="w")
-        self.tree.column("#0", width=px(240), stretch=True)
+        self.tree.heading("#0", text="NAME", anchor="w")
+        self.tree.heading("size", text="SIZE", anchor="e")
+        self.tree.heading("packed", text="PACKED", anchor="e")
+        self.tree.heading("modified", text="MODIFIED", anchor="w")
+        self.tree.column("#0", width=px(230), stretch=True)
         self.tree.column("size", width=px(75), anchor="e", stretch=False)
         self.tree.column("packed", width=px(75), anchor="e", stretch=False)
         self.tree.column("modified", width=px(120), stretch=False)
@@ -2897,30 +4020,40 @@ class ShredPackApp(object):
         self.view_progress = tk.Frame(body, bg=BG)
         inner = tk.Frame(self.view_progress, bg=BG)
         inner.pack(fill="both", expand=True, padx=px(4), pady=px(6))
-        self.lbl_p_title = tk.Label(inner, text="Preparing\u2026", font=(FONT_SEMI, 12), fg=TEXT,
-                                    bg=BG, anchor="w", justify="left", wraplength=px(380))
-        self.lbl_p_title.pack(fill="x", pady=(px(8), 0))
+        top = tk.Frame(inner, bg=BG)
+        top.pack(fill="x", pady=(px(4), 0))
+        self.lbl_p_pct = tk.Label(top, text="", font=(FONT_DISPLAY, 18 if self.compact else 26, "bold"),
+                                  fg=ACCENT, bg=BG)
+        self.lbl_p_pct.pack(side="right", padx=(px(10), 0))
+        self.lbl_p_title = tk.Label(top, text="Preparing\u2026", font=(FONT_DISPLAY, 13, "bold"),
+                                    fg=TEXT, bg=BG, anchor="w", justify="left", wraplength=px(340))
+        self.lbl_p_title.pack(side="left", fill="x", expand=True)
         self.progress_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(inner, style="Mini.Horizontal.TProgressbar", orient="horizontal",
                         mode="determinate", maximum=100, variable=self.progress_var
-                        ).pack(fill="x", pady=(px(14), 0))
+                        ).pack(fill="x", pady=(px(12), 0))
         foot = tk.Frame(inner, bg=BG)
         foot.pack(fill="x", pady=(px(10), 0))
-        self.lbl_p_sub = tk.Label(foot, text="", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w",
-                                  justify="left", wraplength=px(300))
+        self.lbl_p_sub = tk.Label(foot, text="", font=(FONT_MONO, 9), fg=MUTED, bg=BG, anchor="w",
+                                  justify="left", wraplength=px(340))
         self.lbl_p_sub.pack(side="left")
-        cancel = tk.Label(foot, text="Cancel", font=(FONT, 9), fg=MUTED, bg=BG, cursor="hand2")
+        cancel = tk.Label(foot, text="CANCEL", font=(FONT_MONO, 9, "bold"), fg=MUTED, bg=BG,
+                          cursor="hand2")
         cancel.pack(side="right")
         cancel.bind("<Button-1>", lambda e: self.on_cancel())
+        cancel.bind("<Enter>", lambda e: cancel.config(fg=DANGER))
+        cancel.bind("<Leave>", lambda e: cancel.config(fg=MUTED))
 
     def _build_done(self, body):
         px = self.px
         self.view_done = tk.Frame(body, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         box = tk.Frame(self.view_done, bg=CARD)
         box.place(relx=0.5, rely=0.5, anchor="center")
-        tk.Label(box, text="\u2713", font=(FONT_SEMI, 46), fg=GREEN, bg=CARD).pack()
-        self.lbl_d_title = self._label(box, "Extraction complete", 16, True, TEXT)
-        self.lbl_d_title.pack(pady=(px(4), 0))
+        tile = tk.Label(box, text="\u2713", font=(FONT_DISPLAY, 30, "bold"), fg=BG, bg=GREEN,
+                        width=3)
+        tile.pack()
+        self.lbl_d_title = self._heading(box, "Extraction complete", 18)
+        self.lbl_d_title.pack(pady=(px(10), 0))
         self.lbl_d_sub = self._label(box, "", 10, justify="center", wraplength=px(440))
         self.lbl_d_sub.pack(pady=(px(6), 0))
 
@@ -2931,10 +4064,15 @@ class ShredPackApp(object):
         bottom.pack(side="bottom", fill="x")
         ttk.Button(bottom, text="Done", style="Primary.TButton",
                    command=self.close_settings).pack(side="right")
-        self._label(inner, "Settings", 16, True, TEXT, anchor="w").pack(fill="x")
+        replay = tk.Label(bottom, text="SHOW THE QUICK TOUR AGAIN", font=(FONT_MONO, 8, "bold"),
+                          fg=ACCENT, bg=CARD, cursor="hand2")
+        replay.pack(side="left", pady=(px(8), 0))
+        replay.bind("<Button-1>", lambda e: self.tour_restart())
+        self._tag(inner, "Preferences").pack(fill="x")
+        self._heading(inner, "Settings", 20, anchor="w").pack(fill="x", pady=(px(2), 0))
         self._label(inner, "Saved automatically. They apply to every right-click action.", 9,
                     anchor="w").pack(fill="x", pady=(px(2), 0))
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=px(14))
+        self._rule(inner)
 
         self.set_quick_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(inner, text="Extract Here starts immediately (no confirmation screen)",
@@ -2943,20 +4081,30 @@ class ShredPackApp(object):
         self.set_delete_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(inner, text="Delete the original archive after a successful extraction",
                         variable=self.set_delete_var, style="Zen.TCheckbutton",
-                        command=self._settings_changed).pack(anchor="w", pady=(px(6), 0))
+                        command=self._settings_changed).pack(anchor="w", pady=(px(4), 0))
         self.set_sound_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(inner, text="Play a short sound when a task finishes",
+        ttk.Checkbutton(inner, text="Play a short sound when tasks finish",
                         variable=self.set_sound_var, style="Zen.TCheckbutton",
-                        command=self._settings_changed).pack(anchor="w", pady=(px(6), 0))
+                        command=self._settings_changed).pack(anchor="w", pady=(px(4), 0))
 
         ow_row = tk.Frame(inner, bg=CARD)
-        ow_row.pack(fill="x", pady=(px(16), 0))
-        self._label(ow_row, "If a file already exists", 10, anchor="w").pack(side="left")
+        ow_row.pack(fill="x", pady=(px(14), 0))
+        self._tag(ow_row, "If a file already exists").pack(side="left")
         self.set_overwrite_var = tk.StringVar(value=OVERWRITE_POLICIES[0][1])
         combo = ttk.Combobox(ow_row, textvariable=self.set_overwrite_var, state="readonly",
                              values=[label for _k, label in OVERWRITE_POLICIES], width=34)
         combo.pack(side="right")
         combo.bind("<<ComboboxSelected>>", lambda e: self._settings_changed())
+
+        self._rule(inner, pady=(px(16), px(10)))
+        self._tag(inner, "Extract & Free Space", color=DANGER).pack(fill="x")
+        self._label(
+            inner,
+            "A separate action (choice screen, or right-click > Open with ShredPack). It extracts "
+            "the whole archive, then deletes the original permanently - never to the Recycle Bin "
+            "- and only after the extraction checks out. It always asks first, and keeps the "
+            "archive if anything looks wrong.", 9, anchor="w", justify="left",
+            wraplength=px(470)).pack(fill="x", pady=(px(4), 0))
 
     def _register_dnd(self, widget):
         try:
@@ -2968,10 +4116,25 @@ class ShredPackApp(object):
             self._register_dnd(child)
 
     def show(self, view):
-        for v in (self.view_home, self.view_choice, self.view_compress, self.view_browse,
-                  self.view_progress, self.view_done, self.view_settings):
+        if not self._alive:
+            return
+        for _name, v in self._views:
             v.pack_forget()
         view.pack(fill="both", expand=True)
+        self._fit(view)
+
+    def _fit(self, view):
+        """Make the window exactly as tall as the screen being shown (the small right-click
+        progress window keeps its own fixed size)."""
+        if self.compact:
+            return
+        name = next((n for n, v in self._views if v is view), "home")
+        height = VIEW_HEIGHTS.get(name, 560) + (TOUR_EXTRA_HEIGHT if name == "home" and self.tour_active else 0)
+        height = min(self.px(height), self._screen_h - self.px(90))
+        try:
+            self.root.geometry("%dx%d" % (self._win_w, height))
+        except tk.TclError:
+            pass
 
     # ---- settings -----------------------------------------------------------
     def _apply_settings_to_vars(self):
@@ -3026,22 +4189,18 @@ class ShredPackApp(object):
 
     def _reveal(self):
         """Show the window if a compact run kept it hidden (long job, error, or a question)."""
-        if not self._hidden:
+        if not self._hidden or not self._alive:
             return
         self._hidden = False
         try:
             self.root.deiconify()
-            enable_dark_titlebar(self.root)
-            self.root.attributes("-topmost", True)
-            self.root.after(400, lambda: self.root.attributes("-topmost", False))
-            self.root.lift()
-            self.root.focus_force()
+            self._present()
         except tk.TclError:
             pass
 
     def _arm_reveal(self):
         if self._hidden:
-            self.root.after(450, self._reveal_if_busy)
+            self._after(450, self._reveal_if_busy)
 
     def _reveal_if_busy(self):
         if self.state == "processing":
@@ -3049,11 +4208,10 @@ class ShredPackApp(object):
 
     def _close_soon(self, ms=0):
         """Vanish at once; the process only lingers long enough for the chime to finish."""
-        try:
-            self.root.withdraw()
-        except tk.TclError:
-            pass
-        self.root.after(max(int(ms), 1), self.root.destroy)
+        if not self._alive:
+            return
+        self.root.withdraw()
+        self._after(max(int(ms), 1), self._destroy)
 
     def _finish_ok(self, title, lines, notes):
         """Shared success ending. Nothing to read -> the window closes immediately; otherwise
@@ -3064,6 +4222,7 @@ class ShredPackApp(object):
             return
         if self.compact:                    # small window: reuse the progress view
             self._reveal()
+            self.lbl_p_pct.config(text="")
             self.lbl_p_title.config(text="\u2713  " + title)
             self.lbl_p_sub.config(text="  \u2022  ".join(lines))
             self.progress_var.set(100)
@@ -3074,14 +4233,14 @@ class ShredPackApp(object):
             self.show(self.view_done)
         delay = 900 if not notes else 3000
         if self.from_shell:
-            self.root.after(max(delay, sound_ms), self.root.destroy)
+            self._after(max(delay, sound_ms), self._destroy)
         else:
-            self.root.after(delay, self.go_home)
+            self._after(delay, self.go_home)
 
     def _quick_aborted(self):
         """An instant Extract Here was declined (or couldn't start)."""
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.refresh_choice()
             self.show(self.view_choice)
@@ -3093,41 +4252,52 @@ class ShredPackApp(object):
         self.archives = []
         self.selection = None
         self.initial_password = None
-        if sys.platform == "win32":
-            self.refresh_menu_status()
-        else:
-            self.menu_row.pack_forget()
+        self.lbl_p_pct.config(text="")
+        self._tour_sync()
         self.show(self.view_home)
 
-    def refresh_menu_status(self):
-        st = install_state()
-        if st == "current":
-            self.lbl_menu.config(text="Right-click menu: installed \u2713")
-            self.btn_menu.config(text="Remove")
-        elif st == "stale":
-            self.lbl_menu.config(text="Right-click menu: needs updating")
-            self.btn_menu.config(text="Update")
+    # ---- first-run tour -------------------------------------------------------
+    def _tour_sync(self):
+        """Show the slim tour strip on the home screen until it has been finished or skipped."""
+        want = (not self.from_shell) and (not self.settings.get("tutorial_done", False))
+        if want and not self.tour_active:
+            self.tour_active, self.tour_step = True, 0
+        elif not want:
+            self.tour_active = False
+        if self.tour_active:
+            self._tour_render()
+            self.tour.pack(fill="x", pady=(self.px(14), 0))
         else:
-            self.lbl_menu.config(text="Right-click menu: not installed")
-            self.btn_menu.config(text="Add to menu")
+            self.tour.pack_forget()
 
-    def toggle_menu(self):
-        st = install_state()
-        try:
-            if st == "current":
-                uninstall_menu()
-            else:
-                install_menu()
-                messagebox.showinfo(
-                    APP_NAME,
-                    'Done! Right-click an archive and choose "%s" to extract it, '
-                    'or right-click any file or folder and choose "%s" to compress it.\n\n'
-                    'On Windows 11 both appear under "Show more options".' % (APP_NAME, APP_NAME),
-                    parent=self.root)
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, "Couldn't update the registry:\n\n%s" % exc,
-                                 parent=self.root)
-        self.refresh_menu_status()
+    def _tour_render(self):
+        title, text = TOUR_STEPS[self.tour_step]
+        self.lbl_tour_step.config(text=("Quick tour  %d/%d" % (self.tour_step + 1, len(TOUR_STEPS))).upper())
+        self.lbl_tour_title.config(text=title)
+        self.lbl_tour_body.config(text=text)
+        self.btn_tour_next.config(text="Done" if self.tour_step + 1 >= len(TOUR_STEPS) else "Next")
+
+    def tour_next(self):
+        if self.tour_step + 1 >= len(TOUR_STEPS):
+            self.tour_finish()
+            return
+        self.tour_step += 1
+        self._tour_render()
+
+    def tour_finish(self):
+        """Finished or skipped: remember it so the tour never comes back on its own."""
+        self.tour_active = False
+        self.settings["tutorial_done"] = True
+        save_settings(self.settings)
+        self.tour.pack_forget()
+        if self.state == "home":
+            self._fit(self.view_home)
+
+    def tour_restart(self):
+        """Settings > 'show the quick tour again'."""
+        self.settings["tutorial_done"] = False
+        self.tour_active = False
+        self.close_settings()
 
     def choose_archives(self):
         pats = " ".join("*" + e for e in EXTENSIONS)
@@ -3199,10 +4369,18 @@ class ShredPackApp(object):
         self.include_var.set("")
         self.exclude_var.set("")
         self.state = "choice"
-        self.refresh_choice()
-        if mode == "here" and self.settings.get("quick_here", True):
-            # Extract Here does what it says: no confirmation screen, the saved settings apply.
+        if is_instant_mode(mode, self.settings):
+            # Extract Here / Extract to <name>\\: start at once - no options screen, no popup.
             self.begin()
+            if self.state != "processing":
+                self._quick_aborted()
+            return
+        self.refresh_choice()
+        if mode == "free":
+            # Right-click > Open with ShredPack > Extract & Free Space: always confirm first.
+            self.show(self.view_choice)
+            if self._confirm_free_space(self.archives):
+                self.begin(free_space=True)
             if self.state != "processing":
                 self._quick_aborted()
             return
@@ -3228,11 +4406,15 @@ class ShredPackApp(object):
         for w in (self.dest_row, self.sub_chk, self.lbl_hint):
             w.pack_forget()
         if self.mode == "dialog":
-            self.lbl_section.config(text="Destination folder")
+            self.lbl_section.config(text="DESTINATION FOLDER")
             self.dest_row.pack(fill="x")
             self.sub_chk.pack(anchor="w", pady=(px(8), 0))
         else:
-            self.lbl_section.config(text="Extract Here")
+            if self.mode == "folder" and len(self.archives) == 1:
+                section = extract_to_label(first)
+            else:
+                section = "EXTRACT & FREE SPACE" if self.mode == "free" else "EXTRACT HERE"
+            self.lbl_section.config(text=section)
             stem = archive_stem(first) if len(self.archives) == 1 else "<archive name>"
             hint = shorten(os.path.join(folder, stem), 56) + "\\"
             if len(self.archives) > 1:
@@ -3260,7 +4442,7 @@ class ShredPackApp(object):
 
     def cancel_choice(self):
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -3290,7 +4472,7 @@ class ShredPackApp(object):
         (never overwrites or deletes anything)."""
         if not self._confirm_large([source]):
             if self.from_shell:
-                self.root.destroy()
+                self._destroy()
             else:
                 self.go_home()
             return
@@ -3384,7 +4566,7 @@ class ShredPackApp(object):
 
     def cancel_compress(self):
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -3480,7 +4662,7 @@ class ShredPackApp(object):
     def _finish_compress(self, result):
         if result["status"] == "cancelled":
             if self.compact:
-                self.root.destroy()
+                self._destroy()
                 return
             self.state = "compress_choice"
             self.show(self.view_compress)
@@ -3491,7 +4673,7 @@ class ShredPackApp(object):
             messagebox.showerror("%s - Compression failed" % APP_NAME, result["detail"],
                                  parent=self.root)
             if self.compact:
-                self.root.destroy()
+                self._destroy()
                 return
             self.state = "compress_choice"
             self.show(self.view_compress)
@@ -3581,6 +4763,7 @@ class ShredPackApp(object):
                 messagebox.showerror("%s - Problems found" % APP_NAME, text, parent=self.root)
             else:
                 n = sum(r["files"] for r in good)
+                self._chime("done")
                 text = "No errors found.\n\n%d file%s verified in %d archive%s." % (
                     n, "" if n == 1 else "s", len(good), "" if len(good) == 1 else "s")
                 notes = [note for r in good for note in r.get("notes", [])]
@@ -3588,7 +4771,7 @@ class ShredPackApp(object):
                     text += "\n\n" + "\n".join(notes)
                 messagebox.showinfo(APP_NAME, text, parent=self.root)
         if self.auto_test:
-            self.root.destroy()
+            self._destroy()
             return
         self._back_to_choice_view()
 
@@ -3651,7 +4834,7 @@ class ShredPackApp(object):
                 self.root.after_cancel(self._filter_job)
             except tk.TclError:
                 pass
-        self._filter_job = self.root.after(150, self._browse_filter)
+        self._filter_job = self._after(150, self._browse_filter)
 
     def _browse_filter(self):
         self._filter_job = None
@@ -3791,7 +4974,39 @@ class ShredPackApp(object):
         enable_dark_titlebar(dlg)
 
     # ---- running ------------------------------------------------------------
-    def begin(self):
+    def begin_free(self):
+        """The 'Extract & Free Space' button: confirm, then extract and delete the archive."""
+        if self.state != "choice":
+            return
+        if self.selection or parse_patterns(self.include_var.get()) or parse_patterns(self.exclude_var.get()):
+            messagebox.showinfo(
+                APP_NAME,
+                "Extract & Free Space needs the whole archive, because the original is deleted "
+                "afterwards.\n\nClear the selection and the 'Only extract' / 'Skip' filters, "
+                "or use the normal Extract button.", parent=self.root)
+            return
+        if self._confirm_free_space(self.archives):
+            self.begin(free_space=True)
+
+    def _confirm_free_space(self, archives):
+        """The explicit warning that must be accepted before anything is deleted."""
+        self._reveal()
+        names = "\n".join("   " + shorten(os.path.basename(a), 50) for a in archives[:4])
+        if len(archives) > 4:
+            names += "\n   ...and %d more" % (len(archives) - 4)
+        multi = len(archives) > 1
+        parts = any(detect_split_parts(a) for a in archives)
+        text = (
+            "Extract & Free Space\n\n"
+            "ShredPack will extract:\n%s\n\n"
+            "and then PERMANENTLY DELETE the original archive%s%s. It is not sent to the "
+            "Recycle Bin, so it can't be restored.\n\n"
+            "An archive is deleted only after all of its files were extracted and checked. If "
+            "anything fails, or you cancel, it is kept.\n\nContinue?"
+            % (names, "s" if multi else "", " (every part of a split archive)" if parts else ""))
+        return messagebox.askyesno(APP_NAME, text, parent=self.root, icon="warning", default="no")
+
+    def begin(self, free_space=False):
         if self.state != "choice":
             return
         dest_dir, subfolder = None, False
@@ -3802,7 +5017,7 @@ class ShredPackApp(object):
                 return
             dest_dir = os.path.abspath(text)
             subfolder = self.sub_var.get()
-        delete = self.delete_var.get()
+        delete = self.delete_var.get() and not free_space
 
         policy_label = self.overwrite_var.get()
         opts = {
@@ -3812,8 +5027,11 @@ class ShredPackApp(object):
             "overwrite": next((k for k, label in OVERWRITE_POLICIES if label == policy_label),
                               "rename"),
             "password": self.initial_password,
+            "free_space": bool(free_space),
         }
         filtered = bool(opts["selected"] or opts["include"] or opts["exclude"])
+        if free_space and filtered:
+            return        # begin_free() already explained this; never delete after a partial extraction
         if filtered and delete:
             if not messagebox.askyesno(
                     APP_NAME,
@@ -3822,8 +5040,7 @@ class ShredPackApp(object):
                     "would be lost.",
                     parent=self.root, icon="warning", default="no"):
                 delete = False
-        if not filtered and not self._preflight_ok(dest_dir, subfolder):
-            return
+        opts["preflight"] = not filtered     # size / free-space check runs in the worker
 
         self.state = "processing"
         self.action = "extract"
@@ -3842,29 +5059,12 @@ class ShredPackApp(object):
         ).start()
         self._ensure_poll()
 
-    def _preflight_ok(self, dest_dir, subfolder):
-        """Warn (and let the user bail out) before extracting anything that
-        looks like a decompression bomb or won't fit the destination drive.
-        Skipped for split/multi-part archives, which can't be sized cheaply."""
-        for arc in self.archives:
-            if detect_split_parts(arc):
-                continue
-            try:
-                fmt = detect_format(arc)
-            except ArchiveError:
-                continue
-            dest = compute_dest(arc, self.mode, dest_dir, subfolder)
-            risk = preflight_risk(arc, dest, fmt)
-            if risk:
-                self._reveal()
-                proceed = messagebox.askyesno(
-                    APP_NAME,
-                    "%s\n\n%s\n\nContinue anyway?" % (shorten(os.path.basename(arc), 50), risk),
-                    parent=self.root, icon="warning",
-                )
-                if not proceed:
-                    return False
-        return True
+    def _ask_user(self, kind, *payload):
+        """Called from the worker thread: have the UI thread ask a yes/no question and wait."""
+        self.ask_event.clear()
+        self.q.put((kind,) + payload)
+        self.ask_event.wait()
+        return self.ask_value
 
     def on_cancel(self):
         if self.state == "processing":
@@ -3892,7 +5092,7 @@ class ShredPackApp(object):
     def on_close(self):
         if self.state == "processing":
             self.cancel.set()
-        self.root.destroy()
+        self._destroy()
 
     def _ask_password(self, name, retry):
         self.pw_event.clear()
@@ -3914,14 +5114,27 @@ class ShredPackApp(object):
             join_dir = None
             try:
                 dest = compute_dest(arc, mode, dest_dir, subfolder)
+                self.q.put(("dest", idx, total, dest))
 
                 parts = detect_split_parts(arc)
+                originals = parts if parts else [arc]
+                before = [file_signature(p) for p in originals]   # to notice a change mid-extraction
                 source = arc
                 if parts:
                     join_dir = tempfile.mkdtemp(prefix=".shredpack_join_")
                     source = join_split_parts(
                         parts, join_dir,
                         Ctx(self.cancel, lambda p, d, t: self.q.put(("progress", p, d, t))))
+
+                if opts.get("preflight") and not parts:
+                    risk = None
+                    try:
+                        risk = preflight_risk(arc, dest, detect_format(arc))
+                    except ArchiveError:
+                        pass
+                    if risk and not self._ask_user("confirm_risk", name, risk):
+                        self.cancel.set()              # declined: leave everything untouched
+                        raise Cancelled()
 
                 password = opts.get("password")
                 while True:
@@ -3931,7 +5144,7 @@ class ShredPackApp(object):
                               exclude=opts.get("exclude"),
                               overwrite=opts.get("overwrite", "rename"))
                     try:
-                        extract_archive(source, dest, ctx, motw_source=arc)
+                        outcome = extract_archive(source, dest, ctx, motw_source=arc)
                         res["notes"] = list(ctx.notes)
                         break
                     except NeedPassword as need:
@@ -3941,8 +5154,16 @@ class ShredPackApp(object):
                             raise Cancelled()
 
                 res["status"] = "ok"
-                if delete:
-                    originals = parts if parts else [arc]
+                res["dest"] = outcome["dest"]
+                if opts.get("free_space"):
+                    # Extract & Free Space: delete only if every safety check passes.
+                    if self.cancel.is_set():
+                        raise Cancelled()
+                    filtered = bool(opts.get("selected") or opts.get("include") or opts.get("exclude"))
+                    expected = declared_file_sizes(source, password)
+                    res.update(free_space_after_extraction(
+                        originals, before, ctx, outcome, filtered, expected))
+                elif delete:
                     all_ok = True
                     for p in originals:
                         all_ok = remove_original(p) and all_ok
@@ -3961,7 +5182,7 @@ class ShredPackApp(object):
     def _ensure_poll(self):
         if not self._poll_active:
             self._poll_active = True
-            self.root.after(40, self._poll)
+            self._after(40, self._poll)
 
     def _poll(self):
         while True:
@@ -3976,7 +5197,7 @@ class ShredPackApp(object):
                 self._recover_from_error()
                 break
         if self.state == "processing":
-            self.root.after(40, self._poll)
+            self._after(40, self._poll)
         else:
             self._poll_active = False
 
@@ -3991,7 +5212,7 @@ class ShredPackApp(object):
         except Exception:  # noqa: BLE001
             pass
         if self.from_shell:
-            self.root.destroy()
+            self._destroy()
         else:
             self.go_home()
 
@@ -4003,6 +5224,11 @@ class ShredPackApp(object):
                     "list": "Reading "}.get(self.action, "Extracting ")
             self.lbl_p_title.config(text=verb + shorten(name, 44))
             self._set_progress(0, 0, 0)
+        elif kind == "dest":
+            _, _idx, count, dest = msg
+            if count == 1 and self.action == "extract" and self.mode in ("here", "folder", "free"):
+                # the real folder the files are going to (it may carry a " (2)" suffix)
+                self.lbl_p_title.config(text="Extracting to " + shorten(os.path.basename(dest), 40) + "\\")
         elif kind == "progress":
             self._set_progress(msg[1], msg[2], msg[3])
         elif kind == "password":
@@ -4013,6 +5239,13 @@ class ShredPackApp(object):
             pw = simpledialog.askstring(APP_NAME, prompt, show="*", parent=self.root)
             self.pw_value = pw if pw else None
             self.pw_event.set()
+        elif kind == "confirm_risk":
+            _, name, risk = msg
+            self._reveal()
+            self.ask_value = bool(messagebox.askyesno(
+                APP_NAME, "%s\n\n%s\n\nContinue anyway?" % (shorten(name, 50), risk),
+                parent=self.root, icon="warning", default="no"))
+            self.ask_event.set()
         elif kind == "finished":
             self._finish(msg[1])
         elif kind == "compress_finished":
@@ -4043,7 +5276,9 @@ class ShredPackApp(object):
             self.go_home()
 
     def _set_progress(self, pct, done, total):
-        self.progress_var.set(((self.cur_idx - 1) + pct / 100.0) / self.cur_n * 100.0)
+        overall = ((self.cur_idx - 1) + pct / 100.0) / self.cur_n * 100.0
+        self.progress_var.set(overall)
+        self.lbl_p_pct.config(text="%d%%" % int(overall))
         if self.cancel.is_set():
             return
         prefix = "%d of %d  \u2022  " % (self.cur_idx, self.cur_n) if self.cur_n > 1 else ""
@@ -4076,16 +5311,37 @@ class ShredPackApp(object):
             notes.append("Original archive deleted.")
         if any(r["delete_failed"] for r in oks):
             notes.append("The original archive couldn't be deleted.")
+        freed = [r for r in oks if "freed" in r]
+        if freed:
+            total = sum(r["freed"] for r in freed)
+            notes.append("%s deleted permanently - %s freed." % (
+                "Original archive" if len(freed) == 1 else "%d original archives" % len(freed),
+                fmt_size(total)))
+        problems = []
+        for r in oks:
+            if "kept" in r:
+                problems.append("%s\nThe archive was kept because %s. Nothing was deleted."
+                                % (r["name"], r["kept"]))
+            elif "failed" in r:
+                problems.append("%s\nThe files were extracted, but the original archive couldn't "
+                                "be deleted: %s. The extracted files were kept." % (r["name"], r["failed"]))
+        if problems:
+            self._reveal()
+            messagebox.showwarning("%s - Extract & Free Space" % APP_NAME, "\n\n".join(problems),
+                                   parent=self.root)
         for r in oks:
             notes.extend(r.get("notes", []))
-        self._finish_ok("Extraction complete", notes, notes)
+        lines = list(notes)
+        if not self.compact and len(oks) == 1 and oks[0].get("dest"):
+            lines.insert(0, "Extracted to " + shorten(oks[0]["dest"], 56))
+        self._finish_ok("Extraction complete", lines, notes)
 
     def _back_to_choice(self, results):
         finished = {r["path"] for r in results if r["status"] == "ok"}
         self.archives = [a for a in self.archives if a not in finished]
         if not self.archives or self.compact:
             if self.from_shell:
-                self.root.destroy()
+                self._destroy()
             else:
                 self.go_home()
             return
@@ -4120,8 +5376,14 @@ def main():
         if a == "--uninstall":
             uninstall_menu()
             return
+        if a == "--menu-status":
+            root = make_root(False)
+            root.withdraw()
+            messagebox.showinfo(APP_NAME + " - right-click menu status", menu_status_text(), parent=root)
+            root.destroy()
+            return
         if a == "--mode" and i + 1 < len(args):
-            valid = ("dialog", "here", "folder", "test", "compress-quick", "compress-dialog")
+            valid = ("dialog", "here", "folder", "free", "test", "compress-quick", "compress-dialog")
             mode = args[i + 1] if args[i + 1] in valid else "dialog"
             i += 2
             continue
@@ -4140,7 +5402,8 @@ def main():
             return
         app = ShredPackApp(root, from_shell=True)
         app.run_test_now(existing)
-        root.mainloop()
+        if app.alive:
+            root.mainloop()
         return
 
     if mode in ("compress-quick", "compress-dialog"):
@@ -4155,7 +5418,8 @@ def main():
         app = ShredPackApp(root, from_shell=True,
                            compact=(mode == "compress-quick" and len(existing) == 1))
         app.open_compress(existing, mode)
-        root.mainloop()
+        if app.alive:
+            root.mainloop()
         return
 
     if files:
@@ -4166,40 +5430,49 @@ def main():
             messagebox.showerror(APP_NAME, "The selected file couldn't be found:\n\n%s" % files[0])
             root.destroy()
             return
-        ShredPackApp(root, existing, mode, from_shell=True)
-        root.mainloop()
+        app = ShredPackApp(root, existing, mode, from_shell=True)
+        if app.alive:       # a declined question can already have closed the window
+            root.mainloop()
         return
 
-    # Opened directly by the user: offer to add the right-click menu, then show the app.
+    # Opened directly by the user: offer once to add the right-click menu, then show the app.
+    # (The installer registers it itself; this covers the portable exe and menus that point at
+    # another copy of ShredPack. Saying no is remembered, so it never nags.)
     root = make_root(True)
     if sys.platform == "win32":
         state = install_state()
-        if state != "current":
+        settings = load_settings()
+        if state == "stale" or (state == "none" and not settings.get("menu_declined")):
             root.withdraw()
             question = (
-                "The right-click option is out of date or points to a different copy of ShredPack.\n\n"
-                "Update it to use this copy?"
+                "The right-click options are out of date or point to a different copy of ShredPack.\n\n"
+                "Update them to use this copy?"
                 if state == "stale" else
-                'Add "%s" to the Windows right-click menu?\n\n'
-                "On archive files: Extract files...  /  Extract Here.\n"
-                "On any other file or folder: Add to ZIP  /  Add to archive...\n\n"
+                'Add ShredPack to the Windows right-click menu?\n\n'
+                "On archives: Extract files..., Extract Here and Extract to <archive name>, plus an "
+                '"%s" submenu (Extract & Free Space, Test archive, Add to ZIP, Add to archive...).\n'
+                'On other files and folders: "%s" > Add to ZIP / Add to archive...\n\n'
                 "This only changes settings for your user account and needs no administrator rights."
-                % APP_NAME
+                % (SUBMENU_LABEL, SUBMENU_LABEL)
             )
             if messagebox.askyesno(APP_NAME, question, parent=root):
                 try:
                     install_menu()
                     messagebox.showinfo(
                         APP_NAME,
-                        'Done! Right-click an archive and choose "%s" to extract it, '
-                        'or right-click any file or folder and choose "%s" to compress it.\n\n'
-                        'On Windows 11 both appear under "Show more options".' % (APP_NAME, APP_NAME),
+                        "Done! Right-click an archive to extract it, or right-click any file or "
+                        'folder and choose "%s" to compress it.\n\n'
+                        'On Windows 11 the options appear under "Show more options".' % SUBMENU_LABEL,
                         parent=root)
                 except OSError as exc:
                     messagebox.showerror(APP_NAME, "Couldn't update the registry:\n\n%s" % exc, parent=root)
+            elif state == "none":
+                settings["menu_declined"] = True
+                save_settings(settings)
             root.deiconify()
-    ShredPackApp(root)
-    root.mainloop()
+    app = ShredPackApp(root)
+    if app.alive:
+        root.mainloop()
 
 
 if __name__ == "__main__":
