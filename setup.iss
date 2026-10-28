@@ -57,7 +57,13 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Name: "contextmenu"; Description: "Add ShredPack to the right-click menu (Extract files, Extract Here, Open with ShredPack)"; GroupDescription: "Windows integration:"; Flags: checkedonce
 
 [Files]
-Source: "dist-app\ShredPack\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist-app\ShredPack\*"; DestDir: "{app}"; Excludes: "ShredPackMenu.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The Explorer menu extension (native DLL showing "Extract to <archive file name>"). It is only
+; present when the CI built and self-tested it; without it the menu keeps its fixed label.
+; Explorer keeps the DLL loaded, so if it is in use it is replaced / deleted on the next restart.
+#ifexist "dist-app\ShredPack\ShredPackMenu.dll"
+Source: "dist-app\ShredPack\ShredPackMenu.dll"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+#endif
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

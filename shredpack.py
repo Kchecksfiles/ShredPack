@@ -148,9 +148,16 @@ BROWSE_LIMIT = 20000  # rows shown in the archive browser at once (search narrow
 # compression commands (COMPRESS_MENU_ITEMS).
 #
 # Explorer lists classic shell verbs by registry key name, hence the numbered key names.
-# Windows can only show a fixed label for a registry-based verb, so the third item reads
-# "Extract to <archive name>\" literally (Explorer cannot fill in the real name without a
-# compiled shell extension, which ShredPack deliberately does not install).
+# Windows can only show a fixed label for a registry-based verb, so without the native shell
+# extension (shell-ext/ShredPackMenu.dll, installer builds only - see MENU_DLL_NAME) the third
+# item reads "Extract to <archive name>\" literally. With it, Explorer asks the DLL for the
+# title each time and shows the real file name.
+# Installer-only: when ShredPackMenu.dll (a small native IExplorerCommand shell extension, built by
+# the Windows CI) sits next to ShredPack.exe, "Extract to ..." is registered through it so
+# Explorer shows the clicked archive's real name ("Extract to GTA V.zip"). Without the DLL
+# (portable exe, source runs, a build where the DLL failed) the static label above is used.
+MENU_DLL_NAME = "ShredPackMenu.dll"
+MENU_CLSID = "{6F3A1C52-8B1E-4D7A-9C35-2E8A5B7D41F0}"     # must match shell-ext/ShredPackMenu.cpp
 SUBMENU_LABEL = "Open with ShredPack"
 SUBMENU_KEY = "ShredPack4Open"        # the submenu on archive extensions (sorts after the direct items)
 OWNER_VALUE = "ShredPackItem"         # marker value on every top-level key ShredPack creates
@@ -702,6 +709,9 @@ def sanitize_name(name):
 
 def archive_stem(path):
     base = os.path.basename(path)
+    # Multi-part names: "GTA V.zip.001" / "Pack.7z.002" -> "GTA V" / "Pack"; "Game.part1.rar" -> "Game"
+    base = re.sub(r"(?i)\.(zip|7z)\.\d{2,4}$", "", base)
+    base = re.sub(r"(?i)\.part0*\d+\.rar$", "", base)
     low = base.lower()
     for ext in TAR_COMPRESSED + (".tar",):
         if low.endswith(ext):
@@ -3086,6 +3096,19 @@ def menu_command(mode):
     return '%s --mode %s "%%1"' % (launcher_command(), mode)
 
 
+def menu_dll_path():
+    """The Explorer extension DLL beside the installed ShredPack.exe, or None (portable exe,
+    running from source, or a build without it)."""
+    if not getattr(sys, "frozen", False):
+        return None
+    path = os.path.join(os.path.dirname(sys.executable), MENU_DLL_NAME)
+    return path if os.path.isfile(path) else None
+
+
+def clsid_key():
+    return r"Software\Classes\CLSID\%s" % MENU_CLSID
+
+
 def ext_key(ext):
     """The 'Open with ShredPack' submenu on an archive extension."""
     return r"Software\Classes\SystemFileAssociations\%s\shell\%s" % (ext, SUBMENU_KEY)
@@ -3228,6 +3251,7 @@ def _all_menu_paths():
     for cls in COMPRESS_CLASSES:
         paths.append(compress_class_key(cls))
         paths.append(legacy_compress_class_key(cls))
+    paths.append(clsid_key())
     return paths
 
 
@@ -3248,11 +3272,16 @@ def _current_icon():
     return '"%s",0' % sys.executable if getattr(sys, "frozen", False) else None
 
 
-def _direct_plan(ext, icon):
-    """[(key path, values)] for the three direct items of one archive extension."""
+def _direct_plan(ext, icon, dll=None):
+    """[(key path, values)] for the three direct items of one archive extension. With the
+    shell-extension DLL, "Extract to ..." is served by it (its title is the archive's name);
+    otherwise it is an ordinary verb with a fixed label."""
     plan = []
     for name, label, mode in DIRECT_MENU_ITEMS:
         base = ext_verb_key(ext, name)
+        if dll and mode == "folder":
+            plan.append((base, {"ExplorerCommandHandler": MENU_CLSID, OWNER_VALUE: APP_NAME}))
+            continue
         values = {"MUIVerb": label, OWNER_VALUE: APP_NAME}
         if icon:
             values["Icon"] = icon
@@ -3282,8 +3311,12 @@ def _menu_plan(icon):
     submenu, and the compression-only submenu on files ('*', hidden on archives)
     and folders ('Directory')."""
     plan = []
+    dll = menu_dll_path()
+    if dll:
+        plan.append((clsid_key(), {"": "ShredPack Extract-to menu", OWNER_VALUE: APP_NAME}))
+        plan.append((clsid_key() + "\\InprocServer32", {"": dll, "ThreadingModel": "Apartment"}))
     for ext in registry_extensions():
-        plan.extend(_direct_plan(ext, icon))
+        plan.extend(_direct_plan(ext, icon, dll))
         plan.extend(_cascade_plan(ext_key(ext), ARCHIVE_SUBMENU_ITEMS, icon))
     for cls in COMPRESS_CLASSES:
         applies = archive_applies_to() if (cls == "*" and GENERIC_MENU_EXCLUDES_ARCHIVES) else None
