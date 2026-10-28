@@ -33,10 +33,9 @@ import threading
 import time
 import traceback
 import unicodedata
-import urllib.request
 import zipfile
 import zlib
-import webbrowser
+import math
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -45,20 +44,39 @@ if sys.platform == "win32":
     import ctypes
     import winreg
 
-try:
-    import py7zr
-except Exception:  # noqa: BLE001
-    py7zr = None
+class _Lazy(object):
+    """Stands in for an optional library; the real import happens the first time it is used.
 
-try:
-    import pycdlib
-except Exception:  # noqa: BLE001
-    pycdlib = None
+    `if not lib:` still means "not installed", so every existing check keeps working - but a
+    right-click on a .zip no longer pays for importing py7zr / pyzipper / pycdlib at start-up.
+    """
 
-try:
-    import pyzipper
-except Exception:  # noqa: BLE001
-    pyzipper = None
+    def __init__(self, name):
+        self._name, self._mod, self._tried = name, None, False
+
+    def _load(self):
+        if not self._tried:
+            self._tried = True
+            try:
+                import importlib
+                self._mod = importlib.import_module(self._name)
+            except Exception:  # noqa: BLE001
+                self._mod = None
+        return self._mod
+
+    def __bool__(self):
+        return self._load() is not None
+
+    def __getattr__(self, attr):
+        mod = self._load()
+        if mod is None:
+            raise AttributeError("%s is not installed" % self._name)
+        return getattr(mod, attr)
+
+
+py7zr = _Lazy("py7zr")
+pycdlib = _Lazy("pycdlib")
+pyzipper = _Lazy("pyzipper")
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -359,12 +377,18 @@ def parse_version(text):
     return tuple(int(p) for p in re.findall(r"\d+", text)[:3]) or (0,)
 
 
+def open_url(url):
+    import webbrowser  # imported on demand
+    webbrowser.open(url)
+
+
 def check_for_update(callback):
     """Background-safe: fetches VERSION_URL and calls callback(latest_str or None)."""
     if not VERSION_URL:
         return
     def worker():
         try:
+            import urllib.request  # imported here: it pulls in ssl, which a quick right-click never needs
             with urllib.request.urlopen(VERSION_URL, timeout=4) as resp:
                 latest = resp.read(200).decode("utf-8", "replace").strip()
             if parse_version(latest) > parse_version(APP_VERSION):
@@ -420,7 +444,7 @@ def estimate_uncompressed_size(path, fmt):
         if fmt == "zip":
             with zipfile.ZipFile(path) as zf:
                 return sum(i.file_size for i in zf.infolist())
-        if fmt == "7z" and py7zr is not None:
+        if fmt == "7z" and bool(py7zr):
             with py7zr.SevenZipFile(path, mode="r") as z:
                 return sum(f.uncompressed for f in z.list() if not f.is_directory)
         if fmt == "cab":
@@ -699,11 +723,15 @@ def _verify_zip_entry(zf, info, pw, ctx):
             raise ArchiveError("'%s' is corrupted: its checksum (CRC-32) doesn't match the stored value." % label)
         raise ArchiveError("'%s' is corrupted: %s" % (label, exc))
     except (zlib.error, lzma.LZMAError):
+        if info.flag_bits & 0x1 and pw is not None and not aes:
+            raise NeedPassword(True)        # a wrong ZipCrypto password (1 in 256 pass the check byte) decrypts to garbage
         raise ArchiveError("'%s' is corrupted: its compressed data is damaged." % label)
     except EOFError:
         raise ArchiveError("'%s' is truncated: the archive ends before its data does." % label)
     except OSError as exc:
         if exc.errno is None:               # bz2 reports bad data as a bare OSError
+            if info.flag_bits & 0x1 and pw is not None and not aes:
+                raise NeedPassword(True)
             raise ArchiveError("'%s' is corrupted: its compressed data is damaged." % label)
         raise
     if size != info.file_size:
@@ -751,7 +779,7 @@ def extract_zip(path, stage, ctx):
             raise NeedPassword(False)
 
         if uses_aes:
-            if pyzipper is None:
+            if not pyzipper:
                 raise Unsupported(
                     "This ZIP is AES-encrypted. AES support isn't included in this build "
                     "(the pyzipper package is missing)."
@@ -1015,7 +1043,7 @@ def sanitize_stage(stage, ctx=None):
 
 # ---- 7Z (py7zr) ---------------------------------------------------------------
 def extract_7z(path, stage, ctx):
-    if py7zr is None:
+    if not py7zr:
         raise Unsupported("7Z support isn't included in this build (the py7zr package is missing).")
     from py7zr.callbacks import ExtractCallback
 
@@ -1106,7 +1134,7 @@ def _iso_parts(stored_path):
 
 
 def extract_iso(path, stage, ctx):
-    if pycdlib is None:
+    if not pycdlib:
         raise Unsupported("ISO support isn't included in this build (the pycdlib package is missing).")
     iso = pycdlib.PyCdlib()
     iso.open(path)
@@ -1467,6 +1495,151 @@ OVERWRITE_POLICIES = (
 )
 
 
+# --------------------------------------------------------------------------
+# User settings (a small JSON file next to the log; every key is optional)
+# --------------------------------------------------------------------------
+SETTINGS_DEFAULTS = {
+    "quick_here": True,      # "Extract Here" starts at once - no confirmation screen
+    "delete_after": False,   # delete the original archive after a successful extraction
+    "overwrite": "rename",   # one of the OVERWRITE_POLICIES keys
+    "sound": True,           # short chime when a task finishes
+}
+
+
+def settings_path():
+    return os.path.join(app_data_dir(), "settings.json")
+
+
+def load_settings():
+    data = dict(SETTINGS_DEFAULTS)
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return data
+    if isinstance(raw, dict):
+        policy_keys = {k for k, _label in OVERWRITE_POLICIES}
+        for name in SETTINGS_DEFAULTS:
+            value = raw.get(name, SETTINGS_DEFAULTS[name])
+            if name == "overwrite":
+                if value in policy_keys:
+                    data[name] = value
+            elif isinstance(value, bool):
+                data[name] = value
+    return data
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(app_data_dir(), exist_ok=True)
+        tmp = settings_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: settings.get(k, v) for k, v in SETTINGS_DEFAULTS.items()}, f, indent=2)
+        os.replace(tmp, settings_path())
+        return True
+    except OSError:
+        log_exception("Couldn't save settings")
+        return False
+
+
+# --------------------------------------------------------------------------
+# Completion sounds - synthesised in memory, no audio files, Windows only
+# --------------------------------------------------------------------------
+SOUND_RATE = 44100
+DONE_SOUND_STYLE = "glass"   # "glass" | "pop" | "chord"
+
+# note = (start ms, Hz, length ms, peak, decay ms, FM brightness, 2nd-harmonic amount)
+_SOUND_RECIPES = {
+    # three quick rising bell tones (G - D - G) with a soft echo: bright attack, clean tail
+    "glass": dict(total=720, echo=((0.115, 0.30), (0.19, 0.16)), level=0.30, notes=(
+        (0, 784.0, 650, 0.55, 105, 2.4, 0.0), (70, 1174.7, 650, 0.50, 115, 2.1, 0.0),
+        (140, 1568.0, 700, 0.45, 150, 1.7, 0.0))),
+    # a short two-note "bu-bing"
+    "pop": dict(total=420, echo=((0.09, 0.22),), level=0.30, notes=(
+        (0, 659.3, 260, 0.6, 55, 1.6, 0.0), (55, 987.8, 330, 0.55, 90, 1.9, 0.0))),
+    # a soft major chord, strummed over 16 ms
+    "chord": dict(total=760, echo=((0.13, 0.25),), level=0.28, notes=(
+        (0, 1046.5, 700, 0.5, 220, 0.9, 0.0), (8, 1318.5, 700, 0.45, 240, 0.9, 0.0),
+        (16, 1568.0, 700, 0.42, 260, 0.9, 0.0))),
+    # one short low blip (A4 -> F4); the sound used for failures
+    "error": dict(total=380, echo=(), level=None, notes=(
+        (0, 440.0, 220, 0.22, 70, 0.0, 0.18), (110, 349.2, 260, 0.20, 80, 0.0, 0.18))),
+}
+_sound_cache = {}
+_sound_lock = threading.Lock()
+
+
+def synth_sound(kind):
+    """Return (WAV file bytes, length in ms) for 'done' / 'error' (or a style name)."""
+    import io
+    import wave
+    if kind == "done":
+        kind = DONE_SOUND_STYLE
+    rec = _SOUND_RECIPES.get(kind) or _SOUND_RECIPES["glass"]
+    rate = SOUND_RATE
+    n = int(rate * rec["total"] / 1000.0)
+    buf = [0.0] * n
+    two_pi = 2.0 * math.pi
+    for start_ms, freq, length_ms, peak, decay_ms, index, harm in rec["notes"]:
+        s0, decay = int(rate * start_ms / 1000.0), decay_ms / 1000.0
+        for i in range(min(int(rate * length_ms / 1000.0), n - s0)):
+            t = i / rate
+            env = min(1.0, t / 0.004) * math.exp(-t / decay)
+            phase = two_pi * freq * t
+            if index:
+                phase += index * math.exp(-t / 0.06) * math.sin(3.5 * phase)  # bright attack, pure tail
+            v = math.sin(phase) + (harm * math.sin(2.0 * phase) if harm else 0.0)
+            buf[s0 + i] += peak * env * v / (1.0 + harm)
+    for delay_s, gain in rec["echo"]:
+        d = int(rate * delay_s)
+        for i in range(d, n):
+            buf[i] += gain * buf[i - d]
+    if rec["level"]:
+        top = max(abs(v) for v in buf) or 1.0
+        buf = [v * rec["level"] / top for v in buf]
+    fade = int(rate * 0.03)
+    for i in range(min(fade, n)):
+        buf[n - 1 - i] *= i / float(fade)
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", max(-32767, min(32767, int(v * 32767)))) for v in buf))
+    return bio.getvalue(), rec["total"]
+
+
+def _sound(kind):
+    with _sound_lock:
+        if kind not in _sound_cache:
+            _sound_cache[kind] = synth_sound(kind)
+        return _sound_cache[kind]
+
+
+def prime_sounds():
+    """Build the sounds on a background thread so the chime is instant when a job ends."""
+    if sys.platform == "win32":
+        threading.Thread(target=lambda: (_sound("done"), _sound("error")), daemon=True).start()
+
+
+def play_sound(kind):
+    """Play 'done' or 'error' without blocking. Returns its length in ms (0 = nothing played).
+
+    winsound can't play from memory asynchronously (SND_MEMORY | SND_ASYNC raises
+    RuntimeError), so the in-memory WAV plays on a short-lived daemon thread instead.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        import winsound
+        data, ms = _sound(kind)
+        threading.Thread(target=winsound.PlaySound, args=(data, winsound.SND_MEMORY),
+                         daemon=True).start()
+        return ms
+    except Exception:  # noqa: BLE001 - a sound must never break an extraction
+        return 0
+
+
 def merge_into(src, dst, rel="", policy="rename", stats=None):
     """Move everything from the staging folder into dst. `policy` decides what
     happens when a file already exists there (see OVERWRITE_POLICIES). Returns
@@ -1655,7 +1828,7 @@ def list_archive(path, password=None):
                               os.path.getmtime(path), False))
 
     elif fmt == "7z":
-        if py7zr is None:
+        if not py7zr:
             raise Unsupported("7Z support isn't included in this build (the py7zr package is missing).")
         try:
             with py7zr.SevenZipFile(path, mode="r", password=password or None) as z:
@@ -1680,7 +1853,7 @@ def list_archive(path, password=None):
             raise
 
     elif fmt == "iso":
-        if pycdlib is None:
+        if not pycdlib:
             raise Unsupported("ISO support isn't included in this build (the pycdlib package is missing).")
         iso = pycdlib.PyCdlib()
         iso.open(path)
@@ -1805,7 +1978,7 @@ COMPRESS_FORMATS = (
 
 def compress_format_available(key):
     if key == "7z":
-        return py7zr is not None
+        return bool(py7zr)
     return True
 
 
@@ -1913,7 +2086,7 @@ def compress_zip(sources, dest, ctx, password=None, level="normal"):
     ctx.total = max(1, sum(os.path.getsize(p) for _, p, d in members if not d))
 
     if password:
-        if pyzipper is None:
+        if not pyzipper:
             raise Unsupported(
                 "Password-protected ZIPs need the pyzipper package, which isn't included in this build."
             )
@@ -1996,7 +2169,7 @@ def compress_tar(sources, dest, mode, ctx, level="normal"):
 
 
 def compress_7z(sources, dest, ctx, password=None, level="normal"):
-    if py7zr is None:
+    if not py7zr:
         raise Unsupported(
             "7Z creation needs the py7zr package, which isn't included in this build."
         )
@@ -2294,11 +2467,18 @@ def install_state():
 # The application window
 # --------------------------------------------------------------------------
 class ShredPackApp(object):
-    def __init__(self, root, archives=None, mode="dialog", from_shell=False):
+    def __init__(self, root, archives=None, mode="dialog", from_shell=False, compact=False):
         self.root = root
         self.from_shell = from_shell
         self.archives = []
         self.mode = mode
+        self.settings = load_settings()
+        # Right-click actions that run straight through get a small, flat progress window that
+        # stays hidden unless the job lasts more than a blink.
+        self.compact = bool(from_shell and (compact or (
+            archives and mode == "here" and self.settings.get("quick_here", True))))
+        self._hidden = False
+        self._settings_prev = "home"
         self.k = max(1.0, root.winfo_fpixels("1i") / 96.0)
 
         self.state = "home"  # home | choice | compress_choice | processing | finished
@@ -2331,8 +2511,11 @@ class ShredPackApp(object):
             except tk.TclError:
                 pass
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w = self.px(600)
-        h = min(self.px(680), sh - self.px(90))
+        if self.compact:
+            w, h = self.px(440), self.px(118)
+        else:
+            w = self.px(600)
+            h = min(self.px(680), sh - self.px(90))
         root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, max(0, (sh - h) // 3)))
 
         self._build_styles()
@@ -2345,16 +2528,21 @@ class ShredPackApp(object):
         if DND_FILES is not None and hasattr(root, "drop_target_register"):
             self._register_dnd(root)
 
+        if self.compact:
+            self._hidden = True
+            root.withdraw()
+
         if archives:
             self.open_archives(archives, mode)
         else:
             self.go_home()
 
-        enable_dark_titlebar(root)
-        root.attributes("-topmost", True)
-        root.after(400, lambda: root.attributes("-topmost", False))
-        root.lift()
-        root.focus_force()
+        if not self._hidden:
+            enable_dark_titlebar(root)
+            root.attributes("-topmost", True)
+            root.after(400, lambda: root.attributes("-topmost", False))
+            root.lift()
+            root.focus_force()
 
         if not from_shell:
             check_for_update(self._on_update_result)
@@ -2388,6 +2576,9 @@ class ShredPackApp(object):
         s.configure("Zen.Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
                     bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, borderwidth=0,
                     thickness=self.px(6))
+        s.configure("Mini.Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
+                    bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT, borderwidth=0,
+                    thickness=self.px(4))
         s.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
                     borderwidth=0, rowheight=self.px(24), font=(FONT, 10))
         s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#08222e")])
@@ -2421,23 +2612,38 @@ class ShredPackApp(object):
         return tk.Label(parent, text=text, font=(FONT_SEMI if semi else FONT, size),
                         fg=color, bg=CARD, **kw)
 
+    def _draw_logo(self, canvas):
+        """The mark: a stack of slanted shreds, longest on top."""
+        px = self.px
+        for i, (w, color) in enumerate(((24, ACCENT), (18, TEXT), (12, GREEN))):
+            y, h, lean, x0 = px(4 + i * 9), px(6), px(5), px(1)
+            canvas.create_polygon(x0 + lean, y, x0 + lean + px(w), y, x0 + px(w), y + h, x0, y + h,
+                                  fill=color, outline="")
+
     def _build_ui(self):
         px = self.px
         header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=px(28), pady=(px(22), px(12)))
+        if not self.compact:
+            header.pack(fill="x", padx=px(28), pady=(px(22), px(12)))
         logo = tk.Canvas(header, width=px(30), height=px(30), bg=BG, highlightthickness=0)
         logo.pack(side="left")
-        rounded_rect(logo, px(2), px(2), px(28), px(28), px(7), fill=ACCENT, outline="")
-        logo.create_text(px(15), px(15), text="S", font=(FONT, 12, "bold"), fill="#0b2530")
+        self._draw_logo(logo)
         tk.Label(header, text=APP_NAME, font=(FONT_SEMI, 15), fg=TEXT, bg=BG).pack(
             side="left", padx=(px(10), 0))
+        self.settings_link = tk.Label(
+            header, text="Settings", font=(FONT, 9), fg=MUTED, bg=BG, cursor="hand2")
+        self.settings_link.pack(side="right")
+        self.settings_link.bind("<Button-1>", lambda e: self.open_settings())
         self.update_link = tk.Label(
             header, text="", font=(FONT, 9, "underline"), fg=ACCENT, bg=BG, cursor="hand2")
-        self.update_link.pack(side="right")
-        self.update_link.bind("<Button-1>", lambda e: webbrowser.open(RELEASES_URL))
+        self.update_link.pack(side="right", padx=(0, px(14)))
+        self.update_link.bind("<Button-1>", lambda e: open_url(RELEASES_URL))
 
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=px(28), pady=(0, px(24)))
+        if self.compact:
+            body.pack(fill="both", expand=True, padx=px(20), pady=px(12))
+        else:
+            body.pack(fill="both", expand=True, padx=px(28), pady=(0, px(24)))
 
         self._build_home(body)
         self._build_choice(body)
@@ -2445,38 +2651,42 @@ class ShredPackApp(object):
         self._build_browse(body)
         self._build_progress(body)
         self._build_done(body)
+        self._build_settings(body)
 
     def _build_home(self, body):
         px = self.px
-        self.view_home, inner = self._card(body)
+        self.view_home = tk.Frame(body, bg=BG)
+        inner = self.view_home
 
-        icon = tk.Canvas(inner, width=px(84), height=px(84), bg=CARD, highlightthickness=0)
-        icon.pack(pady=(px(6), 0))
-        c, r, lw = px(42), px(36), px(3)
-        icon.create_oval(c - r, c - r, c + r, c + r, fill=ICON_BG, outline=ACCENT, width=px(2))
-        icon.create_line(c, c - px(16), c, c + px(8), fill=ACCENT, width=lw, capstyle="round")
-        icon.create_line(c - px(10), c - px(2), c, c + px(8), c + px(10), c - px(2),
-                         fill=ACCENT, width=lw, capstyle="round", joinstyle="round")
-        icon.create_line(c - px(14), c + px(18), c + px(14), c + px(18),
-                         fill=ACCENT, width=lw, capstyle="round")
+        zw, zh = px(500), px(206)
+        zone = tk.Canvas(inner, width=zw, height=zh, bg=BG, highlightthickness=0, cursor="hand2")
+        zone.pack(pady=(px(6), 0))
+        rounded_rect(zone, px(2), px(2), zw - px(2), zh - px(2), px(18),
+                     fill=CARD, outline="#4a4a4a", width=1, dash=(px(5), px(5)))
+        cx, cy = zw // 2, px(70)
+        zone.create_oval(cx - px(30), cy - px(30), cx + px(30), cy + px(30), fill=ACCENT, outline="")
+        zone.create_line(cx, cy - px(11), cx, cy + px(8), fill="#0b2530", width=px(3), capstyle="round")
+        zone.create_line(cx - px(9), cy, cx, cy + px(9), cx + px(9), cy, fill="#0b2530", width=px(3),
+                         capstyle="round", joinstyle="round")
+        zone.create_text(cx, px(134), text="Drop archives here" if DND_FILES else "Choose an archive",
+                         font=(FONT_SEMI, 15), fill=TEXT)
+        zone.create_text(cx, px(162), text="or click to browse", font=(FONT, 10), fill=MUTED)
+        zone.bind("<Button-1>", lambda e: self.choose_archives())
 
-        self._label(inner, "Extract or create an archive", 16, True, TEXT).pack(pady=(px(12), 0))
-        hint = "Choose a file, or drag and drop it onto this window" if DND_FILES else "Choose an archive, or build a new one"
-        self._label(inner, hint, 10).pack(pady=(px(4), 0))
-        btn_row = tk.Frame(inner, bg=CARD)
-        btn_row.pack(pady=(px(16), 0))
+        btn_row = tk.Frame(inner, bg=BG)
+        btn_row.pack(pady=(px(18), 0))
         ttk.Button(btn_row, text="Choose Archive...", style="Primary.TButton",
                    command=self.choose_archives).pack(side="left")
         ttk.Button(btn_row, text="Create Archive...", style="Secondary.TButton",
                    command=self.choose_compress_entry).pack(side="left", padx=(px(10), 0))
         ttk.Button(btn_row, text="Checksum...", style="Secondary.TButton",
                    command=self.choose_checksum).pack(side="left", padx=(px(10), 0))
-        self._label(inner, FORMATS_LABEL, 8, color="#7c7c7c").pack(pady=(px(12), 0))
+        tk.Label(inner, text=FORMATS_LABEL, font=(FONT, 8), fg="#7c7c7c", bg=BG).pack(pady=(px(14), 0))
 
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(16), px(12)))
-        self.menu_row = tk.Frame(inner, bg=CARD)
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(18), px(10)))
+        self.menu_row = tk.Frame(inner, bg=BG)
         self.menu_row.pack(fill="x")
-        self.lbl_menu = self._label(self.menu_row, "", 10, color=TEXT, anchor="w")
+        self.lbl_menu = tk.Label(self.menu_row, text="", font=(FONT, 10), fg=TEXT, bg=BG, anchor="w")
         self.lbl_menu.pack(side="left")
         self.btn_menu = ttk.Button(self.menu_row, text="", style="Secondary.TButton",
                                    command=self.toggle_menu)
@@ -2531,19 +2741,19 @@ class ShredPackApp(object):
         self.lbl_sel = self._label(inner, "", 10, color=ACCENT, anchor="w", justify="left",
                                    wraplength=px(480))
 
+        # "Delete original" and "If a file already exists" live in Settings now; the variables
+        # stay (filled from the saved settings) because begin() reads them.
         self.delete_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(inner, text="Delete original archive after successful extraction",
-                        variable=self.delete_var, style="Zen.TCheckbutton"
-                        ).pack(anchor="w", pady=(px(14), 0))
-
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(14), px(8)))
-        ow_row = tk.Frame(inner, bg=CARD)
-        ow_row.pack(fill="x")
-        self._label(ow_row, "If a file already exists", 10, anchor="w").pack(side="left")
         self.overwrite_var = tk.StringVar(value=OVERWRITE_POLICIES[0][1])
-        ttk.Combobox(ow_row, textvariable=self.overwrite_var, state="readonly",
-                     values=[label for _k, label in OVERWRITE_POLICIES], width=34
-                     ).pack(side="right")
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(px(14), px(8)))
+        opt_row = tk.Frame(inner, bg=CARD)
+        opt_row.pack(fill="x")
+        self.lbl_opts = self._label(opt_row, "", 9, anchor="w", justify="left", wraplength=px(370))
+        self.lbl_opts.pack(side="left")
+        opts_link = tk.Label(opt_row, text="Change in Settings", font=(FONT, 9, "underline"),
+                             fg=ACCENT, bg=CARD, cursor="hand2")
+        opts_link.pack(side="right")
+        opts_link.bind("<Button-1>", lambda e: self.open_settings())
         flt = tk.Frame(inner, bg=CARD)
         flt.pack(fill="x", pady=(px(8), 0))
         self._label(flt, "Only extract", 10, anchor="w").grid(row=0, column=0, sticky="w")
@@ -2684,20 +2894,24 @@ class ShredPackApp(object):
 
     def _build_progress(self, body):
         px = self.px
-        self.view_progress, inner = self._card(body)
-        bottom = tk.Frame(inner, bg=CARD)
-        bottom.pack(side="bottom", fill="x")
-        ttk.Button(bottom, text="Cancel", style="Secondary.TButton",
-                   command=self.on_cancel).pack(side="right")
-        self.lbl_p_title = self._label(inner, "Preparing\u2026", 14, True, TEXT, anchor="w",
-                                       justify="left", wraplength=px(480))
-        self.lbl_p_title.pack(fill="x", pady=(px(30), 0))
+        self.view_progress = tk.Frame(body, bg=BG)
+        inner = tk.Frame(self.view_progress, bg=BG)
+        inner.pack(fill="both", expand=True, padx=px(4), pady=px(6))
+        self.lbl_p_title = tk.Label(inner, text="Preparing\u2026", font=(FONT_SEMI, 12), fg=TEXT,
+                                    bg=BG, anchor="w", justify="left", wraplength=px(380))
+        self.lbl_p_title.pack(fill="x", pady=(px(8), 0))
         self.progress_var = tk.DoubleVar(value=0.0)
-        ttk.Progressbar(inner, style="Zen.Horizontal.TProgressbar", orient="horizontal",
+        ttk.Progressbar(inner, style="Mini.Horizontal.TProgressbar", orient="horizontal",
                         mode="determinate", maximum=100, variable=self.progress_var
-                        ).pack(fill="x", pady=(px(22), 0))
-        self.lbl_p_sub = self._label(inner, "", 10, anchor="w")
-        self.lbl_p_sub.pack(fill="x", pady=(px(10), 0))
+                        ).pack(fill="x", pady=(px(14), 0))
+        foot = tk.Frame(inner, bg=BG)
+        foot.pack(fill="x", pady=(px(10), 0))
+        self.lbl_p_sub = tk.Label(foot, text="", font=(FONT, 9), fg=MUTED, bg=BG, anchor="w",
+                                  justify="left", wraplength=px(300))
+        self.lbl_p_sub.pack(side="left")
+        cancel = tk.Label(foot, text="Cancel", font=(FONT, 9), fg=MUTED, bg=BG, cursor="hand2")
+        cancel.pack(side="right")
+        cancel.bind("<Button-1>", lambda e: self.on_cancel())
 
     def _build_done(self, body):
         px = self.px
@@ -2710,6 +2924,40 @@ class ShredPackApp(object):
         self.lbl_d_sub = self._label(box, "", 10, justify="center", wraplength=px(440))
         self.lbl_d_sub.pack(pady=(px(6), 0))
 
+    def _build_settings(self, body):
+        px = self.px
+        self.view_settings, inner = self._card(body)
+        bottom = tk.Frame(inner, bg=CARD)
+        bottom.pack(side="bottom", fill="x")
+        ttk.Button(bottom, text="Done", style="Primary.TButton",
+                   command=self.close_settings).pack(side="right")
+        self._label(inner, "Settings", 16, True, TEXT, anchor="w").pack(fill="x")
+        self._label(inner, "Saved automatically. They apply to every right-click action.", 9,
+                    anchor="w").pack(fill="x", pady=(px(2), 0))
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=px(14))
+
+        self.set_quick_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inner, text="Extract Here starts immediately (no confirmation screen)",
+                        variable=self.set_quick_var, style="Zen.TCheckbutton",
+                        command=self._settings_changed).pack(anchor="w")
+        self.set_delete_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(inner, text="Delete the original archive after a successful extraction",
+                        variable=self.set_delete_var, style="Zen.TCheckbutton",
+                        command=self._settings_changed).pack(anchor="w", pady=(px(6), 0))
+        self.set_sound_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inner, text="Play a short sound when a task finishes",
+                        variable=self.set_sound_var, style="Zen.TCheckbutton",
+                        command=self._settings_changed).pack(anchor="w", pady=(px(6), 0))
+
+        ow_row = tk.Frame(inner, bg=CARD)
+        ow_row.pack(fill="x", pady=(px(16), 0))
+        self._label(ow_row, "If a file already exists", 10, anchor="w").pack(side="left")
+        self.set_overwrite_var = tk.StringVar(value=OVERWRITE_POLICIES[0][1])
+        combo = ttk.Combobox(ow_row, textvariable=self.set_overwrite_var, state="readonly",
+                             values=[label for _k, label in OVERWRITE_POLICIES], width=34)
+        combo.pack(side="right")
+        combo.bind("<<ComboboxSelected>>", lambda e: self._settings_changed())
+
     def _register_dnd(self, widget):
         try:
             widget.drop_target_register(DND_FILES)
@@ -2721,9 +2969,122 @@ class ShredPackApp(object):
 
     def show(self, view):
         for v in (self.view_home, self.view_choice, self.view_compress, self.view_browse,
-                  self.view_progress, self.view_done):
+                  self.view_progress, self.view_done, self.view_settings):
             v.pack_forget()
         view.pack(fill="both", expand=True)
+
+    # ---- settings -----------------------------------------------------------
+    def _apply_settings_to_vars(self):
+        self.delete_var.set(bool(self.settings.get("delete_after", False)))
+        self.overwrite_var.set(dict(OVERWRITE_POLICIES).get(
+            self.settings.get("overwrite", "rename"), OVERWRITE_POLICIES[0][1]))
+
+    def _opts_summary(self):
+        label = self.overwrite_var.get().split(" (")[0].split(" - ")[0]
+        return "If a file exists: %s  \u2022  Delete original: %s" % (
+            label, "yes" if self.delete_var.get() else "no")
+
+    def open_settings(self):
+        if self.state not in ("home", "choice"):
+            return
+        self._settings_prev = self.state
+        self.state = "settings"
+        self.set_quick_var.set(bool(self.settings.get("quick_here", True)))
+        self.set_delete_var.set(bool(self.settings.get("delete_after", False)))
+        self.set_sound_var.set(bool(self.settings.get("sound", True)))
+        self.set_overwrite_var.set(dict(OVERWRITE_POLICIES).get(
+            self.settings.get("overwrite", "rename"), OVERWRITE_POLICIES[0][1]))
+        self.show(self.view_settings)
+
+    def _settings_changed(self):
+        label = self.set_overwrite_var.get()
+        self.settings.update({
+            "quick_here": bool(self.set_quick_var.get()),
+            "delete_after": bool(self.set_delete_var.get()),
+            "sound": bool(self.set_sound_var.get()),
+            "overwrite": next((k for k, lab in OVERWRITE_POLICIES if lab == label), "rename"),
+        })
+        save_settings(self.settings)
+
+    def close_settings(self):
+        if self.state != "settings":
+            return
+        self._settings_changed()
+        if self._settings_prev == "choice" and self.archives:
+            self.state = "choice"
+            self._apply_settings_to_vars()
+            self.refresh_choice()
+            self.show(self.view_choice)
+        else:
+            self.go_home()
+
+    # ---- quiet, quick endings ------------------------------------------------
+    def _chime(self, kind="done"):
+        if not self.settings.get("sound", True):
+            return 0
+        return play_sound(kind)
+
+    def _reveal(self):
+        """Show the window if a compact run kept it hidden (long job, error, or a question)."""
+        if not self._hidden:
+            return
+        self._hidden = False
+        try:
+            self.root.deiconify()
+            enable_dark_titlebar(self.root)
+            self.root.attributes("-topmost", True)
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _arm_reveal(self):
+        if self._hidden:
+            self.root.after(450, self._reveal_if_busy)
+
+    def _reveal_if_busy(self):
+        if self.state == "processing":
+            self._reveal()
+
+    def _close_soon(self, ms=0):
+        """Vanish at once; the process only lingers long enough for the chime to finish."""
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+        self.root.after(max(int(ms), 1), self.root.destroy)
+
+    def _finish_ok(self, title, lines, notes):
+        """Shared success ending. Nothing to read -> the window closes immediately; otherwise
+        the details stay up briefly."""
+        sound_ms = self._chime("done")
+        if self.from_shell and not notes:
+            self._close_soon(sound_ms)
+            return
+        if self.compact:                    # small window: reuse the progress view
+            self._reveal()
+            self.lbl_p_title.config(text="\u2713  " + title)
+            self.lbl_p_sub.config(text="  \u2022  ".join(lines))
+            self.progress_var.set(100)
+            self.show(self.view_progress)
+        else:
+            self.lbl_d_title.config(text=title)
+            self.lbl_d_sub.config(text="\n".join(lines))
+            self.show(self.view_done)
+        delay = 900 if not notes else 3000
+        if self.from_shell:
+            self.root.after(max(delay, sound_ms), self.root.destroy)
+        else:
+            self.root.after(delay, self.go_home)
+
+    def _quick_aborted(self):
+        """An instant Extract Here was declined (or couldn't start)."""
+        if self.from_shell:
+            self.root.destroy()
+        else:
+            self.refresh_choice()
+            self.show(self.view_choice)
 
     # ---- home ---------------------------------------------------------------
     def go_home(self):
@@ -2834,16 +3195,22 @@ class ShredPackApp(object):
         self.initial_password = None
         self.dest_var.set(os.path.dirname(self.archives[0]))
         self.sub_var.set(False)
-        self.delete_var.set(False)
-        self.overwrite_var.set(OVERWRITE_POLICIES[0][1])
+        self._apply_settings_to_vars()
         self.include_var.set("")
         self.exclude_var.set("")
         self.state = "choice"
         self.refresh_choice()
+        if mode == "here" and self.settings.get("quick_here", True):
+            # Extract Here does what it says: no confirmation screen, the saved settings apply.
+            self.begin()
+            if self.state != "processing":
+                self._quick_aborted()
+            return
         self.show(self.view_choice)
 
     def refresh_choice(self):
         px = self.px
+        self.lbl_opts.config(text=self._opts_summary())
         first = self.archives[0]
         folder = os.path.dirname(first)
         if len(self.archives) == 1:
@@ -2936,6 +3303,7 @@ class ShredPackApp(object):
         files, size, _skipped, capped = scan_sources(sources, CONFIRM_FILES, CONFIRM_BYTES)
         if not capped:
             return True
+        self._reveal()
         return messagebox.askyesno(
             APP_NAME,
             "This is a large job: at least {:,} files / {} so far.\n\n"
@@ -3085,6 +3453,9 @@ class ShredPackApp(object):
         self.lbl_p_sub.config(text="")
         self.cur_idx, self.cur_n = 1, 1
         self.show(self.view_progress)
+        if self.settings.get("sound", True):
+            prime_sounds()
+        self._arm_reveal()
         threading.Thread(
             target=self._compress_worker, args=(sources, dest_path, fmt_key, password, level),
             daemon=True,
@@ -3108,24 +3479,26 @@ class ShredPackApp(object):
 
     def _finish_compress(self, result):
         if result["status"] == "cancelled":
+            if self.compact:
+                self.root.destroy()
+                return
             self.state = "compress_choice"
             self.show(self.view_compress)
             return
         if result["status"] == "error":
+            self._reveal()
+            self._chime("error")
             messagebox.showerror("%s - Compression failed" % APP_NAME, result["detail"],
                                  parent=self.root)
+            if self.compact:
+                self.root.destroy()
+                return
             self.state = "compress_choice"
             self.show(self.view_compress)
             return
         self.state = "finished"
-        self.lbl_d_title.config(text="Compression complete")
-        self.lbl_d_sub.config(text="\n".join([os.path.basename(result["dest"])] + result["notes"]))
-        self.show(self.view_done)
-        delay = 1300 if not result["notes"] else 4000
-        if self.from_shell:
-            self.root.after(delay, self.root.destroy)
-        else:
-            self.root.after(delay, self.go_home)
+        self._finish_ok("Compression complete",
+                        [os.path.basename(result["dest"])] + result["notes"], result["notes"])
 
     # ---- test archive ---------------------------------------------------------
     def test_selected(self):
@@ -3459,6 +3832,9 @@ class ShredPackApp(object):
         self.lbl_p_title.config(text="Preparing\u2026")
         self.lbl_p_sub.config(text="")
         self.show(self.view_progress)
+        if self.settings.get("sound", True):
+            prime_sounds()
+        self._arm_reveal()
         threading.Thread(
             target=self._worker,
             args=(list(self.archives), self.mode, dest_dir, subfolder, delete, opts),
@@ -3480,6 +3856,7 @@ class ShredPackApp(object):
             dest = compute_dest(arc, self.mode, dest_dir, subfolder)
             risk = preflight_risk(arc, dest, fmt)
             if risk:
+                self._reveal()
                 proceed = messagebox.askyesno(
                     APP_NAME,
                     "%s\n\n%s\n\nContinue anyway?" % (shorten(os.path.basename(arc), 50), risk),
@@ -3507,6 +3884,8 @@ class ShredPackApp(object):
             self.cancel_compress()
         elif self.state == "browse":
             self.browse_back()
+        elif self.state == "settings":
+            self.close_settings()
         elif self.state == "processing":
             self.on_cancel()
 
@@ -3603,6 +3982,7 @@ class ShredPackApp(object):
 
     def _recover_from_error(self):
         self.state = "home"
+        self._reveal()
         try:
             messagebox.showerror(
                 APP_NAME,
@@ -3626,6 +4006,7 @@ class ShredPackApp(object):
         elif kind == "progress":
             self._set_progress(msg[1], msg[2], msg[3])
         elif kind == "password":
+            self._reveal()
             _, name, retry = msg
             prompt = ("Wrong password. Try again.\n\n" if retry else "") + (
                 '"%s" is password-protected.\nEnter password:' % shorten(name, 40))
@@ -3681,6 +4062,8 @@ class ShredPackApp(object):
             return
 
         if fails:
+            self._reveal()
+            self._chime("error")
             text = "\n\n".join("%s\n%s" % (r["name"], r["detail"]) for r in fails)
             if oks:
                 text += "\n\n%d archive(s) extracted successfully." % len(oks)
@@ -3695,19 +4078,12 @@ class ShredPackApp(object):
             notes.append("The original archive couldn't be deleted.")
         for r in oks:
             notes.extend(r.get("notes", []))
-        self.lbl_d_title.config(text="Extraction complete")
-        self.lbl_d_sub.config(text="\n".join(notes))
-        self.show(self.view_done)
-        delay = 1300 if not notes else 4000
-        if self.from_shell:
-            self.root.after(delay, self.root.destroy)
-        else:
-            self.root.after(delay, self.go_home)
+        self._finish_ok("Extraction complete", notes, notes)
 
     def _back_to_choice(self, results):
         finished = {r["path"] for r in results if r["status"] == "ok"}
         self.archives = [a for a in self.archives if a not in finished]
-        if not self.archives:
+        if not self.archives or self.compact:
             if self.from_shell:
                 self.root.destroy()
             else:
@@ -3776,7 +4152,8 @@ def main():
                                  % (files[0] if files else "?"))
             root.destroy()
             return
-        app = ShredPackApp(root, from_shell=True)
+        app = ShredPackApp(root, from_shell=True,
+                           compact=(mode == "compress-quick" and len(existing) == 1))
         app.open_compress(existing, mode)
         root.mainloop()
         return
