@@ -116,7 +116,7 @@ app.settings.update(delete_after=False, overwrite="rename")
 d = fresh("quickwarn"); z = os.path.join(d, "w.zip"); make_zip(z, {"a.txt": "A"})
 messagebox.askyesno.reset_mock(); messagebox.askyesno.return_value = False
 with mock.patch.object(sp, "preflight_risk", return_value="Test warning: looks risky"):
-    app.go_home(); app.open_archives([z], "here")
+    app.go_home(); app.open_archives([z], "here"); pump(app, {"finished"})
 check("declined warning: nothing extracted, back on the confirmation screen",
       app.state == "choice" and not os.path.exists(os.path.join(d, "w")))
 check("...and the warning was shown", messagebox.askyesno.called)
@@ -165,14 +165,15 @@ check("play_sound is a silent no-op where winsound doesn't exist", sp.play_sound
 # Windows path, with a fake winsound: it must NOT combine SND_MEMORY with SND_ASYNC (that raises
 # RuntimeError on real Windows) - the in-memory WAV plays synchronously on a background thread.
 calls = []
-fake_ws = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, PlaySound=lambda data, flags: calls.append((data, flags)))
-with mock.patch.dict(sys.modules, {"winsound": fake_ws}), mock.patch.object(sp.sys, "platform", "win32"):
+fake_ws = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, SND_NODEFAULT=2, MB_OK=0, MessageBeep=lambda k: None,
+                                PlaySound=lambda data, flags: calls.append((data, flags)))
+with mock.patch.dict(sys.modules, {"winsound": fake_ws}), mock.patch.object(sp, "IS_WINDOWS", True):
     sp._sound_cache.clear()
     ms = sp.play_sound("done")
     deadline = time.time() + 5
     while not calls and time.time() < deadline: time.sleep(0.01)
 check("play_sound (Windows path) returns the chime length and plays from memory",
-      ms > 300 and len(calls) == 1 and calls[0][0][:4] == b"RIFF" and calls[0][1] == fake_ws.SND_MEMORY)
+      ms > 300 and len(calls) == 1 and calls[0][0][:4] == b"RIFF" and calls[0][1] == (fake_ws.SND_MEMORY | fake_ws.SND_NODEFAULT) and not calls[0][1] & fake_ws.SND_ASYNC)
 sp._sound_cache.clear()
 
 # ---- selection from browser + delete guard ----
@@ -528,6 +529,103 @@ check("dynamic label: shown on the options screen for 'Extract to <name>'",
 import inspect
 src = inspect.getsource(sp.ShredPackApp._build_ui)
 check("header: the short blue accent line is gone", "ACCENT, width" not in src)
+
+# ---- "Extract to <archive name>\\": instant, correct folder, no popup; sound only on success ----
+def sound_session():
+    """Fake winsound: records every sound that would have been played (by kind)."""
+    played = []
+    done_wav, err_wav = sp._sound("done")[0], sp._sound("error")[0]
+    def play(data, flags):
+        played.append("done" if data == done_wav else "error" if data == err_wav else "other")
+    fake = types.SimpleNamespace(SND_MEMORY=4, SND_ASYNC=1, SND_NODEFAULT=2, MB_OK=0,
+                                 MessageBeep=lambda k: played.append("beep"), PlaySound=play)
+    return played, fake
+
+def wait_sounds(played, n, timeout=3):
+    end = time.time() + timeout
+    while len(played) < n and time.time() < end: time.sleep(0.01)
+    time.sleep(0.05)
+
+shown = []
+d = fresh("etf"); z = os.path.join(d, "GTA V.zip"); make_zip(z, {"readme.txt": "hi", "data/a.bin": "A" * 100})
+played, fake = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake}), mock.patch.object(sp, "IS_WINDOWS", True):
+    sp.settings_path()                      # default settings: sound on
+    messagebox.askyesno.reset_mock(); messagebox.showwarning.reset_mock(); messagebox.showerror.reset_mock()
+    app, root = shell_launch([z], "folder", True)
+    orig_show = app.show; app.show = lambda v: (shown.append(v), orig_show(v))[1]
+    check("extract-to: starts extracting immediately (processing, no options screen)",
+          app.state == "processing" and app.view_choice not in shown)
+    pump(app, {"finished"}); wait_sounds(played, 1)
+check("extract-to: files land in a folder named after the archive ('GTA V'), archive untouched",
+      sorted(os.listdir(os.path.join(d, "GTA V"))) == ["data", "readme.txt"] and os.path.exists(z))
+check("extract-to: no confirmation popup, no warning, no error",
+      not messagebox.askyesno.called and not messagebox.showwarning.called and not messagebox.showerror.called)
+titles = [c.kwargs.get("text", "") for c in app.lbl_p_title.config.call_args_list]
+check("extract-to: the progress title names the real destination folder 'GTA V\\'",
+      any(t == "Extracting to GTA V\\" for t in titles))
+check("sound: exactly one 'done' chime after a successful extraction", played == ["done"])
+
+# a second run into the same place gets its own folder and the label follows ('GTA V (2)')
+played2, fake2 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake2}), mock.patch.object(sp, "IS_WINDOWS", True):
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"}); wait_sounds(played2, 1)
+check("extract-to: an existing folder is never mixed into - the new one is 'GTA V (2)'",
+      os.path.isdir(os.path.join(d, "GTA V (2)")) and sorted(os.listdir(os.path.join(d, "GTA V"))) == ["data", "readme.txt"])
+
+# the sound setting is honoured
+d = fresh("etf_mute"); z = os.path.join(d, "Quiet.zip"); make_zip(z, {"a.txt": "A"})
+played3, fake3 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake3}), mock.patch.object(sp, "IS_WINDOWS", True):
+    app, root = shell_launch([z], "folder", True); app.settings["sound"] = False
+    pump(app, {"finished"}); wait_sounds(played3, 1, 0.5)
+check("sound: nothing plays when the setting is off", played3 == [])
+
+# failure: error popup, error sound (never the success chime), archive intact, no half-made folder
+d = fresh("etf_bad"); z = os.path.join(d, "Broken.zip"); make_zip(z, {"a.txt": "A" * 8000})
+raw = bytearray(open(z, "rb").read()); raw[45:70] = b"\xff" * 25; open(z, "wb").write(bytes(raw)); size0 = os.path.getsize(z)
+played4, fake4 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake4}), mock.patch.object(sp, "IS_WINDOWS", True):
+    messagebox.showerror.reset_mock()
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"}); wait_sounds(played4, 1)
+check("extract-to (damaged archive): the error is shown, the archive is untouched, nothing is left behind",
+      messagebox.showerror.called and os.path.getsize(z) == size0 and not os.path.exists(os.path.join(d, "Broken")))
+check("sound: a failure plays the error sound, never the success chime", played4 == ["error"])
+
+# cancellation (declining the size warning): no sound, nothing extracted, archive intact
+d = fresh("etf_cancel"); z = os.path.join(d, "Big.zip"); make_zip(z, {"a.txt": "A"})
+played5, fake5 = sound_session()
+with mock.patch.dict(sys.modules, {"winsound": fake5}), mock.patch.object(sp, "IS_WINDOWS", True), \
+     mock.patch.object(sp, "preflight_risk", return_value="Test warning: looks risky"):
+    app, root = shell_launch([z], "folder", False)     # answer 'No' to the essential warning
+    pump(app, {"finished"}); wait_sounds(played5, 1, 0.5)
+check("cancel: the essential size warning is still asked, declining extracts nothing and plays no sound",
+      messagebox.askyesno.called and played5 == [] and os.path.exists(z) and not os.path.exists(os.path.join(d, "Big")))
+check("cancel: the window closes normally afterwards", root.destroy.call_count == 1 and app.alive is False)
+
+# a user cancel during extraction (Cancel button) also stays silent and keeps the archive
+d = fresh("etf_cancel2"); z = os.path.join(d, "C.zip"); make_zip(z, {"a.txt": "A" * 100000})
+played6, fake6 = sound_session()
+def cancelling_extract(path, dest, ctx, motw_source=None):
+    ctx.cancel.set()                                   # the user presses Cancel mid-extraction
+    ctx._check()                                       # -> raises Cancelled exactly as the engine does
+real_extract = sp.extract_archive
+with mock.patch.dict(sys.modules, {"winsound": fake6}), mock.patch.object(sp, "IS_WINDOWS", True), \
+     mock.patch.object(sp, "extract_archive", cancelling_extract):
+    app, root = new_app(from_shell=False); app.open_archives([z], "dialog")
+    app.begin(); pump(app, {"finished"}); wait_sounds(played6, 1, 0.5)
+check("cancel: pressing Cancel plays no sound and the archive remains", played6 == [] and os.path.exists(z))
+
+
+# the size / free-space pre-check no longer blocks the UI thread
+import threading as _th
+seen = []
+d = fresh("pf_thread"); z = os.path.join(d, "p.zip"); make_zip(z, {"a.txt": "A"})
+def spy(path, dest, fmt):
+    seen.append(_th.current_thread() is _th.main_thread()); return None
+with mock.patch.object(sp, "preflight_risk", spy):
+    app, root = shell_launch([z], "folder", True); pump(app, {"finished"})
+check("speed: the pre-extraction size check runs on the worker thread, not the UI thread", seen == [False])
 
 print("\nUI SMOKE RESULT: %d/%d" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)

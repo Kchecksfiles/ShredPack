@@ -269,7 +269,7 @@ def press_cancel():
     app.on_cancel()                          # the Cancel button
 
 
-loop.after(300, press_cancel)
+loop.after(20, press_cancel)
 closed = loop.run(limit=15)
 latency = (loop.destroyed_at - click["t"]) if (closed and "t" in click) else 99
 check("right-click Test on a large zip: Cancel closes the window", closed)
@@ -284,7 +284,7 @@ app, loop = in_app()
 app.open_archives([big], "dialog")
 app.test_selected()
 t_click = {}
-loop.after(300, lambda: (t_click.__setitem__("t", time.monotonic()), app.on_cancel()))
+loop.after(20, lambda: (t_click.__setitem__("t", time.monotonic()), app.on_cancel()))
 returned = loop.run(until=lambda: "t" in t_click and app.state == "choice", limit=15)
 check("in-app Test: Cancel returns to the options screen", returned)
 check("...within a second", returned and time.monotonic() - t_click["t"] < 1.5)
@@ -343,6 +343,25 @@ check("...without ever showing a window for a fast job", not app.root.deiconify.
 check("...in well under a second (%.0f ms)" % ((loop.destroyed_at - loop.t0) * 1000),
       loop.destroyed and loop.destroyed_at - loop.t0 < 1.0)
 check("...and with no popups", not messagebox.showinfo.called and not messagebox.showerror.called)
+
+
+# ---- "Extract to <archive name>\\" from Explorer: instant, no confirmation, even with quick-Here off ----
+open(sp.settings_path(), "w").write('{"quick_here": false}')
+d = fresh("extractto")
+z = os.path.join(d, "GTA V.zip")
+make_zip(z, {"a.txt": "A", "sub/b.txt": "B"})
+messagebox.askyesno.reset_mock(); messagebox.showinfo.reset_mock(); messagebox.showerror.reset_mock()
+loop, app = shell_launch("--mode", "folder", z)
+check("Extract to <name> (shell): compact, hidden, starts at once", app is not None and app.compact
+      and app.state == "processing" and app.root.withdraw.called)
+closed = loop.run(limit=15)
+check("...extracts and closes by itself", closed)
+check("...into 'GTA V' next to the archive, archive kept",
+      sorted(os.listdir(os.path.join(d, "GTA V"))) == ["a.txt", "sub"] and os.path.exists(z))
+check("...no window shown and no popups of any kind",
+      not app.root.deiconify.called and not messagebox.askyesno.called
+      and not messagebox.showinfo.called and not messagebox.showerror.called)
+os.remove(sp.settings_path())
 
 # a job that takes a while reveals the small progress window, then still closes by itself
 def slow_extract(source, dest, ctx, motw_source=None):
